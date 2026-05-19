@@ -1119,7 +1119,10 @@ enum CLI {
         guard !body.isEmpty else {
             FileHandle.standardError.write("--body is required\n".data(using: .utf8)!); return 2
         }
-        let author = flagValue(args, "--author")
+        // CLI is overwhelmingly used by agents/scripts; default the author to "agent"
+        // so replies show up under the agent identity, not the local system user.
+        // Pass --author explicitly to override.
+        let author = flagValue(args, "--author") ?? "agent"
         let url = resolveURL(file)
         guard FileManager.default.fileExists(atPath: url.path) else {
             FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
