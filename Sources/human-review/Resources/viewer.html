@@ -10,11 +10,13 @@
     --muted: #6e6e73;
     --accent: #0a84ff;
     --hover-bg: rgba(10,132,255,0.06);
-    --thread-bg: #f5f7fa;
-    --thread-border: #d2d6dc;
+    --active-stripe: #ffaf0a;
+    --settled-stripe: #b0b0b8;
+    --thread-bg: #fbf7ee;
+    --thread-bg-settled: #f1f1f3;
+    --thread-border: #e6dfd1;
     --code-bg: #f5f5f7;
     --border: #d2d2d7;
-    --review-pill: #ff9f0a;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -22,8 +24,9 @@
       --bg: #1d1d1f;
       --muted: #98989d;
       --hover-bg: rgba(10,132,255,0.14);
-      --thread-bg: #2c2c2e;
-      --thread-border: #3a3a3c;
+      --thread-bg: #322c1c;
+      --thread-bg-settled: #2c2c2e;
+      --thread-border: #4a4030;
       --code-bg: #2c2c2e;
       --border: #3a3a3c;
     }
@@ -44,17 +47,12 @@
     border-radius: 6px;
   }
   .block:hover { background: var(--hover-bg); }
-  /* Keyboard-navigated focus (↑/↓ between blocks). Inset outline so adjacent
-     focused blocks don't cause layout shift. */
   .block.focused {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
     background: var(--hover-bg);
   }
   .block.focused > .add-btn { opacity: 1; pointer-events: auto; }
-  /* Invisible pseudo-element extends the hover-tolerant zone to the left,
-     so the cursor can travel from the block to the [+] button without
-     leaving the hover area (which would hide the button mid-click). */
   .block::before {
     content: '';
     position: absolute;
@@ -84,71 +82,93 @@
     padding: 0;
     transition: opacity 0.1s ease-out, transform 0.08s ease-out;
   }
-  /* Reveal when the block is hovered, OR when the button itself has hover/focus
-     (covers the moment the cursor sits exactly on the button after the block
-     loses hover state due to overlap quirks). */
   .block:hover > .add-btn,
   .add-btn:hover,
-  .add-btn:focus {
-    opacity: 1;
-    pointer-events: auto;
-  }
+  .add-btn:focus { opacity: 1; pointer-events: auto; }
   .add-btn:hover { transform: scale(1.08); }
   .add-btn:active { transform: scale(0.95); }
-  .block.has-thread > .add-btn {
+  .block.has-active > .add-btn {
+    background: var(--active-stripe);
+    color: #1d1d1f;
     opacity: 1;
     pointer-events: auto;
-    background: var(--review-pill);
-  }
-  .block.has-flag > .add-btn {
-    background: #ffd60a;
-    color: #1d1d1f;
   }
 
   /* Flag-block pulse animation (lands here after n/N navigation) */
   @keyframes flag-pulse {
     0%, 100% { box-shadow: none; }
-    35%      { box-shadow: 0 0 0 4px rgba(255,214,10,0.55); }
+    35%      { box-shadow: 0 0 0 4px rgba(255,175,10,0.55); }
   }
   .block.pulse { animation: flag-pulse 0.6s ease-out; }
 
-  /* Thread */
+  /* Threads */
+  .threads { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+
   .thread {
-    margin-top: 8px;
-    border-left: 3px solid var(--review-pill);
+    border-left: 3px solid var(--active-stripe);
     background: var(--thread-bg);
     border-radius: 6px;
-    padding: 4px 0;
+    overflow: hidden;
   }
-  .thread.has-flag { border-left-color: #ffd60a; }
+  .thread.settled {
+    border-left-color: var(--settled-stripe);
+    background: var(--thread-bg-settled);
+    opacity: 0.85;
+  }
+
+  .thread-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px;
+    font-size: 12px; color: var(--muted);
+    border-bottom: 1px solid var(--thread-border);
+  }
+  .thread.settled .thread-head { cursor: pointer; }
+  .thread-head .line {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    background: var(--accent); color: white;
+    padding: 1px 6px; border-radius: 3px;
+  }
+  .thread-head .status {
+    font-weight: 600;
+  }
+  .thread-head .status.active { color: #b75d00; }
+  .thread-head .status.settled { color: var(--muted); }
+  .thread-head .count {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .thread-head .spacer { flex: 1; }
+  .thread-head button {
+    background: transparent; border: 1px solid var(--border); color: var(--fg);
+    cursor: pointer; font-size: 11px; padding: 2px 8px;
+    border-radius: 3px;
+  }
+  .thread-head button:hover { background: rgba(0,0,0,0.06); }
+  @media (prefers-color-scheme: dark) {
+    .thread-head button:hover { background: rgba(255,255,255,0.08); }
+  }
+
+  .thread-body { display: block; }
+  .thread.collapsed .thread-body { display: none; }
+
   .comment {
     padding: 8px 12px;
     border-bottom: 1px solid var(--thread-border);
   }
-  .comment.flag {
-    background: rgba(255,214,10,0.10);
-  }
-  .comment.flag .comment-head .author::before {
-    content: "🚩 ";
-  }
-  .comment.flag .comment-head .author {
-    color: #b75d00;
-  }
-  @media (prefers-color-scheme: dark) {
-    .comment.flag .comment-head .author { color: #ffd60a; }
-  }
   .comment:last-child { border-bottom: none; }
+  .comment.is-agent { background: rgba(10,132,255,0.05); }
   .comment-head {
     display: flex; align-items: center; gap: 8px;
     font-size: 12px; color: var(--muted);
     margin-bottom: 4px;
   }
   .comment-head .author { color: var(--fg); font-weight: 600; font-size: 12px; }
-  .comment-head .line {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  .comment.is-agent .comment-head .author::before { content: "🤖 "; }
+  .comment-head .reply-marker {
+    color: var(--muted);
     font-size: 11px;
-    background: var(--accent); color: white;
-    padding: 1px 6px; border-radius: 3px;
   }
   .comment-head .spacer { flex: 1; }
   .comment-head button {
@@ -165,17 +185,6 @@
     white-space: pre-wrap;
     word-wrap: break-word;
   }
-  .comment-body p { margin: 0.3em 0; }
-
-  /* Orphaned comments section */
-  .orphan-section { margin-top: 40px; }
-  .orphan-title {
-    font-size: 13px; color: var(--muted);
-    text-transform: uppercase; letter-spacing: 0.05em;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 4px; margin-bottom: 10px;
-  }
-  .orphan-thread { border-left-color: var(--muted); }
 
   /* Composer */
   .composer {
@@ -184,7 +193,7 @@
   }
   .composer textarea {
     width: 100%;
-    min-height: 64px;
+    min-height: 60px;
     font: inherit;
     font-size: 13.5px;
     padding: 8px;
@@ -197,7 +206,12 @@
   .composer textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
   .composer-actions {
     display: flex; gap: 8px; justify-content: flex-end;
+    align-items: center;
     margin-top: 6px;
+  }
+  .composer-actions .hint {
+    flex: 1;
+    font-size: 11px; color: var(--muted);
   }
   .composer-actions button {
     font: inherit; font-size: 13px;
@@ -213,8 +227,14 @@
     color: white;
     border-color: var(--accent);
   }
-  .composer-actions button.primary:disabled {
-    opacity: 0.5; cursor: not-allowed;
+
+  /* Orphaned section */
+  .orphan-section { margin-top: 40px; }
+  .orphan-title {
+    font-size: 13px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px; margin-bottom: 10px;
   }
 
   /* Markdown content */
@@ -243,49 +263,20 @@
 'use strict';
 
 const state = {
-  blocks: [],          // [{start, text}]
-  comments: [],        // raw comment objects from Swift
-  activeComposer: null, // line number with open composer
-  focusedBlock: null   // line number of keyboard-focused block (null = none)
+  blocks: [],            // [{start, text}]
+  comments: [],          // flat list from Swift
+  newComposerBlock: null,  // line of block where the user is composing a NEW thread
+  replyComposerRoot: null, // root id of thread the user is replying to
+  focusedBlock: null,
+  expandedSettled: new Set(),  // root ids of settled threads the user has expanded
 };
 
-function focusedIndex() {
-  if (state.focusedBlock === null) return -1;
-  return state.blocks.findIndex(b => b.start === state.focusedBlock);
-}
-
-function moveFocus(delta) {
-  if (state.blocks.length === 0) return;
-  let idx = focusedIndex();
-  if (idx < 0) {
-    idx = delta > 0 ? 0 : state.blocks.length - 1;
-  } else {
-    idx = Math.max(0, Math.min(state.blocks.length - 1, idx + delta));
-  }
-  state.focusedBlock = state.blocks[idx].start;
-  render();
-  scrollFocusedIntoView();
-}
-
-function focusNext() {
-  const idx = focusedIndex();
-  if (idx >= 0 && idx + 1 < state.blocks.length) {
-    state.focusedBlock = state.blocks[idx + 1].start;
-  }
-}
-
-function scrollFocusedIntoView() {
-  const el = document.querySelector(`.block[data-line="${state.focusedBlock}"]`);
-  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-}
-
+// ─── parsing source into blocks ────────────────────────────────────────────────
 function splitBlocks(src) {
   const lines = src.split('\n');
   const blocks = [];
-  let cur = [];
-  let curStart = 0;
-  let inFence = false;
-  let fenceMarker = '';
+  let cur = [], curStart = 0;
+  let inFence = false, fenceMarker = '';
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const m = line.match(/^(\s*)(```+|~~~+)/);
@@ -312,78 +303,240 @@ function escapeHtml(s) {
   })[c]);
 }
 
-function commentsFor(line) {
-  return state.comments
-    .filter(c => c.anchorLine === line)
-    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+// ─── thread grouping ───────────────────────────────────────────────────────────
+function byId() {
+  const m = new Map();
+  for (const c of state.comments) m.set(c.id, c);
+  return m;
 }
 
+function rootOf(c, idx) {
+  let cur = c, safety = 0;
+  while (cur && cur.replyTo && safety++ < 1000) {
+    cur = idx.get(cur.replyTo) || null;
+  }
+  return cur;
+}
+
+function buildThreads() {
+  // Returns: rootId -> { root, comments: [chronological list including root] }
+  const idx = byId();
+  const threads = new Map();
+  for (const c of state.comments) {
+    const r = rootOf(c, idx);
+    if (!r) continue;  // orphan-of-tree: replyTo points to nothing
+    if (!threads.has(r.id)) threads.set(r.id, { root: r, comments: [] });
+    threads.get(r.id).comments.push(c);
+  }
+  for (const t of threads.values()) {
+    t.comments.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  }
+  return threads;
+}
+
+function threadsForBlock(line, threads) {
+  const result = [];
+  for (const t of threads.values()) {
+    if (t.root.anchorLine === line && !t.root.orphaned) result.push(t);
+  }
+  return result.sort((a, b) => new Date(a.root.createdAt) - new Date(b.root.createdAt));
+}
+
+function activeThreadLines(threads) {
+  const lines = new Set();
+  for (const t of threads.values()) {
+    if (!t.root.resolved && !t.root.orphaned) lines.add(t.root.anchorLine);
+  }
+  return Array.from(lines).sort((a, b) => a - b);
+}
+
+// ─── messaging swift ───────────────────────────────────────────────────────────
 function postSwift(payload) {
   if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.swift) {
     window.webkit.messageHandlers.swift.postMessage(payload);
   }
 }
 
-function renderComment(c) {
+// ─── rendering ────────────────────────────────────────────────────────────────
+function renderComment(c, idx) {
   const dt = new Date(c.createdAt);
   const date = dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-  const isFlag = c.kind === 'flag';
-  const actionLabel = isFlag ? 'Resolve' : 'Delete';
+  const time = dt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  const isAgent = (c.author || '').toLowerCase() === 'agent';
+  const isReply = !!c.replyTo;
   return `
-    <div class="comment ${isFlag ? 'flag' : ''}" data-id="${escapeHtml(c.id)}">
+    <div class="comment ${isAgent ? 'is-agent' : ''}" data-id="${escapeHtml(c.id)}">
       <div class="comment-head">
-        <span class="line">L${c.anchorLine + 1}</span>
         <span class="author">${escapeHtml(c.author)}</span>
-        <span>${date}</span>
+        ${isReply ? '<span class="reply-marker">↪ reply</span>' : ''}
+        <span>${date} ${time}</span>
         <span class="spacer"></span>
-        <button data-action="delete" data-id="${escapeHtml(c.id)}">${actionLabel}</button>
+        <button data-action="delete-comment" data-id="${escapeHtml(c.id)}">Delete</button>
       </div>
       <div class="comment-body">${escapeHtml(c.body)}</div>
     </div>
   `;
 }
 
-function renderComposer(line, text) {
+function renderComposer({ placeholder, primaryLabel, action, dataAttrs, hint }) {
+  const attrs = Object.entries(dataAttrs || {})
+    .map(([k, v]) => `data-${k}="${escapeHtml(String(v))}"`).join(' ');
   return `
-    <div class="composer" data-composer-line="${line}">
-      <textarea placeholder="Leave a comment on this block…" autofocus></textarea>
+    <div class="composer" ${attrs}>
+      <textarea placeholder="${escapeHtml(placeholder)}" autofocus></textarea>
       <div class="composer-actions">
+        <span class="hint">${escapeHtml(hint || '')}</span>
         <button data-action="cancel">Cancel</button>
-        <button class="primary" data-action="submit" data-line="${line}" data-text="${escapeHtml(text)}">Add comment</button>
+        <button class="primary" data-action="${action}" ${attrs}>${escapeHtml(primaryLabel)}</button>
       </div>
     </div>
   `;
 }
 
-function renderThread(b) {
-  const cs = commentsFor(b.start);
-  const showComposer = state.activeComposer === b.start;
-  if (!cs.length && !showComposer) return '';
-  const hasFlag = cs.some(c => c.kind === 'flag');
-  let html = `<div class="thread${hasFlag ? ' has-flag' : ''}">`;
-  for (const c of cs) html += renderComment(c);
-  if (showComposer) html += renderComposer(b.start, b.text);
-  html += '</div>';
+function renderThread(t) {
+  const settled = t.root.resolved;
+  const expanded = !settled || state.expandedSettled.has(t.root.id);
+  const replyOpen = state.replyComposerRoot === t.root.id;
+  const count = t.comments.length;
+
+  let html = `<div class="thread ${settled ? 'settled' : ''} ${settled && !expanded ? 'collapsed' : ''}"
+                   data-root="${escapeHtml(t.root.id)}">`;
+  // Head
+  html += `<div class="thread-head" data-action="${settled ? 'toggle-thread' : ''}" data-root="${escapeHtml(t.root.id)}">
+    <span class="line">L${t.root.anchorLine + 1}</span>
+    <span class="status ${settled ? 'settled' : 'active'}">
+      ${settled ? '✓ Resolved' : '● Active'}
+    </span>
+    <span class="count">${count} ${count === 1 ? 'msg' : 'msgs'}</span>
+    <span class="spacer"></span>
+    ${settled
+      ? `<button data-action="reopen-thread" data-root="${escapeHtml(t.root.id)}">Reopen</button>`
+      : `<button data-action="resolve-thread" data-root="${escapeHtml(t.root.id)}">Resolve</button>`
+    }
+  </div>`;
+
+  // Body
+  html += `<div class="thread-body">`;
+  for (const c of t.comments) html += renderComment(c);
+  if (!settled || replyOpen) {
+    html += renderComposer({
+      placeholder: settled ? 'Reply (will re-open this thread)…' : 'Reply to this thread…',
+      primaryLabel: settled ? 'Reply & reopen' : 'Reply',
+      action: 'submit-reply',
+      dataAttrs: { root: t.root.id },
+      hint: 'Tab to submit · Esc to cancel'
+    });
+  }
+  html += `</div>`;
+
+  html += `</div>`;
   return html;
 }
 
-function flaggedLines() {
-  const lines = new Set();
-  for (const c of state.comments) if (c.kind === 'flag') lines.add(c.anchorLine);
-  return Array.from(lines).sort((a, b) => a - b);
+function render() {
+  const scrollY = window.scrollY;
+  const container = document.getElementById('content');
+  const frag = document.createDocumentFragment();
+  const threads = buildThreads();
+
+  for (const b of state.blocks) {
+    const div = document.createElement('div');
+    const blockThreads = threadsForBlock(b.start, threads);
+    const hasActive = blockThreads.some(t => !t.root.resolved);
+    const classes = ['block'];
+    if (blockThreads.length) classes.push('has-threads');
+    if (hasActive) classes.push('has-active');
+    if (state.focusedBlock === b.start) classes.push('focused');
+    div.className = classes.join(' ');
+    div.setAttribute('data-line', String(b.start));
+
+    let threadsHtml = '';
+    if (blockThreads.length) {
+      threadsHtml = '<div class="threads">';
+      for (const t of blockThreads) threadsHtml += renderThread(t);
+      threadsHtml += '</div>';
+    }
+    const newComposerHtml = state.newComposerBlock === b.start ? renderComposer({
+      placeholder: 'Start a new thread on this block…',
+      primaryLabel: 'Comment',
+      action: 'submit-new',
+      dataAttrs: { line: b.start, text: b.text },
+      hint: 'Tab to submit · Esc to cancel'
+    }) : '';
+
+    div.innerHTML = `
+      <button class="add-btn" data-action="open-new" data-line="${b.start}" data-text="${escapeHtml(b.text)}" title="New thread">+</button>
+      <div class="block-body">${marked.parse(b.text)}</div>
+      ${threadsHtml}
+      ${newComposerHtml}
+    `;
+    frag.appendChild(div);
+  }
+
+  // Orphaned threads — comments whose root.orphaned=true
+  const orphanRoots = Array.from(threads.values()).filter(t => t.root.orphaned);
+  if (orphanRoots.length) {
+    const sec = document.createElement('div');
+    sec.className = 'orphan-section';
+    sec.innerHTML = `<h3 class="orphan-title">⚠ Orphaned threads (anchor text gone from source)</h3>`;
+    const wrap = document.createElement('div');
+    wrap.className = 'threads';
+    for (const t of orphanRoots) wrap.innerHTML += renderThread(t);
+    sec.appendChild(wrap);
+    frag.appendChild(sec);
+  }
+
+  container.replaceChildren(frag);
+  if (window.scrollY !== scrollY) window.scrollTo(0, scrollY);
+
+  // Auto-focus open composer textarea (preventScroll so viewport stays put)
+  const activeTextarea =
+    document.querySelector('.composer .primary[data-action="submit-new"]')?.closest('.composer')?.querySelector('textarea') ||
+    document.querySelector('.composer .primary[data-action="submit-reply"]')?.closest('.composer')?.querySelector('textarea');
+  if (activeTextarea) activeTextarea.focus({ preventScroll: true });
 }
 
-function nextFlag(direction) {
-  const flags = flaggedLines();
-  if (flags.length === 0) return;
+// ─── navigation between blocks ─────────────────────────────────────────────────
+function focusedIndex() {
+  if (state.focusedBlock === null) return -1;
+  return state.blocks.findIndex(b => b.start === state.focusedBlock);
+}
+
+function moveFocus(delta) {
+  if (!state.blocks.length) return;
+  let idx = focusedIndex();
+  if (idx < 0) {
+    idx = delta > 0 ? 0 : state.blocks.length - 1;
+  } else {
+    idx = Math.max(0, Math.min(state.blocks.length - 1, idx + delta));
+  }
+  state.focusedBlock = state.blocks[idx].start;
+  render();
+  scrollFocusedIntoView();
+}
+
+function focusNext() {
+  const idx = focusedIndex();
+  if (idx >= 0 && idx + 1 < state.blocks.length) {
+    state.focusedBlock = state.blocks[idx + 1].start;
+  }
+}
+
+function scrollFocusedIntoView() {
+  const el = document.querySelector(`.block[data-line="${state.focusedBlock}"]`);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function nextActiveThread(direction) {
+  const lines = activeThreadLines(buildThreads());
+  if (!lines.length) return;
   const cur = state.focusedBlock;
   let target;
   if (direction > 0) {
-    target = cur === null ? flags[0]
-           : (flags.find(l => l > cur) ?? flags[0]);
+    target = cur === null ? lines[0] : (lines.find(l => l > cur) ?? lines[0]);
   } else {
-    const before = flags.filter(l => l < (cur ?? Infinity));
-    target = before.length ? before[before.length - 1] : flags[flags.length - 1];
+    const before = lines.filter(l => l < (cur ?? Infinity));
+    target = before.length ? before[before.length - 1] : lines[lines.length - 1];
   }
   state.focusedBlock = target;
   render();
@@ -395,169 +548,129 @@ function pulseBlock(line) {
   const el = document.querySelector(`.block[data-line="${line}"]`);
   if (!el) return;
   el.classList.remove('pulse');
-  // Force reflow so re-adding the class restarts the animation
   void el.offsetWidth;
   el.classList.add('pulse');
   setTimeout(() => el.classList.remove('pulse'), 700);
 }
 
-function render() {
-  // Preserve scroll across the rebuild. Use replaceChildren() to swap content
-  // atomically — innerHTML = '' would momentarily collapse document height
-  // and trigger the browser to clamp scrollY to 0 (the "jumps to top" bug).
-  const scrollY = window.scrollY;
-  const container = document.getElementById('content');
-
-  const frag = document.createDocumentFragment();
-  for (const b of state.blocks) {
-    const div = document.createElement('div');
-    const cs = commentsFor(b.start);
-    const hasFlag = cs.some(c => c.kind === 'flag');
-    const classes = ['block'];
-    if (cs.length) classes.push('has-thread');
-    if (hasFlag) classes.push('has-flag');
-    if (state.focusedBlock === b.start) classes.push('focused');
-    div.className = classes.join(' ');
-    div.setAttribute('data-line', String(b.start));
-    div.innerHTML = `
-      <button class="add-btn" data-action="add" data-line="${b.start}" data-text="${escapeHtml(b.text)}" title="Add comment">+</button>
-      <div class="block-body">${marked.parse(b.text)}</div>
-      ${renderThread(b)}
-    `;
-    frag.appendChild(div);
-  }
-
-  // Orphaned comments — anchorText not found after a reload.
-  const orphans = state.comments.filter(c => c.orphaned);
-  if (orphans.length) {
-    const sec = document.createElement('div');
-    sec.className = 'orphan-section';
-    sec.innerHTML = `<h3 class="orphan-title">⚠ Orphaned comments (source moved · re-anchor by hand)</h3>`;
-    const thread = document.createElement('div');
-    thread.className = 'thread orphan-thread';
-    for (const c of orphans) thread.innerHTML += renderComment(c);
-    sec.appendChild(thread);
-    frag.appendChild(sec);
-  }
-
-  container.replaceChildren(frag);
-
-  // Defensive: if scroll position got clamped anyway, restore it.
-  if (window.scrollY !== scrollY) window.scrollTo(0, scrollY);
-
-  // Auto-focus composer textarea if one just opened — preventScroll keeps the
-  // viewport pinned (default focus may scroll the textarea into view).
-  if (state.activeComposer !== null) {
-    const ta = document.querySelector(`.composer[data-composer-line="${state.activeComposer}"] textarea`);
-    if (ta) {
-      ta.focus({ preventScroll: true });
-      // Make sure the composer is at least visible, but don't recenter aggressively.
-      const composer = ta.closest('.composer');
-      if (composer) {
-        const rect = composer.getBoundingClientRect();
-        const vh = window.innerHeight;
-        if (rect.bottom > vh || rect.top < 0) {
-          composer.scrollIntoView({ behavior: 'instant', block: 'nearest' });
-        }
-      }
-    }
-  }
-}
-
-// Single delegated click handler
+// ─── click handling ────────────────────────────────────────────────────────────
 document.addEventListener('click', (e) => {
-  const t = e.target;
-  if (!(t instanceof Element)) return;
+  const t = e.target.closest('[data-action]');
+  if (!t) return;
   const action = t.getAttribute('data-action');
-  if (!action) return;
   e.stopPropagation();
 
-  if (action === 'add') {
+  if (action === 'open-new') {
     const line = parseInt(t.getAttribute('data-line'), 10);
-    state.activeComposer = line;
+    state.newComposerBlock = line;
+    state.replyComposerRoot = null;
     render();
     return;
   }
   if (action === 'cancel') {
-    state.activeComposer = null;
+    state.newComposerBlock = null;
+    state.replyComposerRoot = null;
     render();
     return;
   }
-  if (action === 'submit') {
+  if (action === 'submit-new') {
     const composer = t.closest('.composer');
-    const ta = composer.querySelector('textarea');
-    const body = (ta.value || '').trim();
+    const body = (composer.querySelector('textarea').value || '').trim();
     if (!body) return;
     const line = parseInt(t.getAttribute('data-line'), 10);
     const text = t.getAttribute('data-text') || '';
     postSwift({ type: 'addComment', line, text, body });
-    state.activeComposer = null;
-    // After submit, advance keyboard focus to the next block so Enter starts
-    // commenting on it immediately.
+    state.newComposerBlock = null;
     focusNext();
     scrollFocusedIntoView();
-    // Swift will push updated state back via applyState.
     return;
   }
-  if (action === 'delete') {
-    // Used for both "Delete" (regular comments) and "Resolve" (flags).
-    // No confirmation: the sidecar JSON keeps a record and the agent gets a
-    // resolved/deleted event in the stream — easy to undo if needed.
+  if (action === 'submit-reply') {
+    const composer = t.closest('.composer');
+    const body = (composer.querySelector('textarea').value || '').trim();
+    if (!body) return;
+    const root = t.getAttribute('data-root');
+    postSwift({ type: 'addComment', replyTo: root, body });
+    state.replyComposerRoot = null;
+    return;
+  }
+  if (action === 'resolve-thread') {
+    const root = t.getAttribute('data-root');
+    postSwift({ type: 'resolveThread', id: root });
+    return;
+  }
+  if (action === 'reopen-thread') {
+    const root = t.getAttribute('data-root');
+    postSwift({ type: 'reopenThread', id: root });
+    return;
+  }
+  if (action === 'toggle-thread') {
+    const root = t.getAttribute('data-root');
+    if (state.expandedSettled.has(root)) state.expandedSettled.delete(root);
+    else state.expandedSettled.add(root);
+    render();
+    return;
+  }
+  if (action === 'delete-comment') {
     const id = t.getAttribute('data-id');
-    if (!id) return;
     postSwift({ type: 'deleteComment', id });
     return;
   }
 });
 
-// Keyboard model:
-//   ↑ / ↓          (no composer open)  Move focus between blocks
-//   Enter          (no composer open)  Open composer on focused block
-//   Tab            (composer open)     Submit + auto-advance focus to next block
-//   Cmd/Ctrl+Enter (composer open)     Submit (alternative)
-//   Escape         (composer open)     Cancel
+// ─── keyboard ──────────────────────────────────────────────────────────────────
 document.addEventListener('keydown', (e) => {
   const inTextarea = e.target && e.target.tagName === 'TEXTAREA';
   const inComposerTextarea = inTextarea && e.target.closest('.composer');
-  const composerOpen = state.activeComposer !== null;
+  const composerOpen = state.newComposerBlock !== null || state.replyComposerRoot !== null;
 
-  // --- Composer-open actions ---
   if (composerOpen) {
     const isCmdEnter = (e.metaKey || e.ctrlKey) && e.key === 'Enter';
     const isTabSubmit = e.key === 'Tab' && !e.shiftKey && inComposerTextarea;
     if (isCmdEnter || isTabSubmit) {
-      const btn = document.querySelector('.composer .primary[data-action="submit"]');
+      const btn = document.querySelector('.composer .primary');
       if (btn) { btn.click(); e.preventDefault(); }
       return;
     }
     if (e.key === 'Escape') {
-      state.activeComposer = null;
+      state.newComposerBlock = null;
+      state.replyComposerRoot = null;
       render();
       e.preventDefault();
       return;
     }
-    return; // let other keys (typing, cursor movement) pass through to textarea
+    return;
   }
 
-  // --- Navigation (no composer, not inside any textarea) ---
   if (inTextarea) return;
+
   if (e.key === 'ArrowDown' || e.key === 'j') {
     moveFocus(1); e.preventDefault();
   } else if (e.key === 'ArrowUp' || e.key === 'k') {
     moveFocus(-1); e.preventDefault();
   } else if (e.key === 'Enter' && state.focusedBlock !== null) {
-    state.activeComposer = state.focusedBlock;
+    // Decide: if focused block has an active thread → open reply on the
+    // most recent one. Otherwise → open new-thread composer.
+    const blockThreads = threadsForBlock(state.focusedBlock, buildThreads())
+      .filter(t => !t.root.resolved);
+    if (blockThreads.length) {
+      state.replyComposerRoot = blockThreads[blockThreads.length - 1].root.id;
+      state.newComposerBlock = null;
+    } else {
+      state.newComposerBlock = state.focusedBlock;
+      state.replyComposerRoot = null;
+    }
     render();
     e.preventDefault();
   } else if (e.key === 'n' && !e.shiftKey) {
-    nextFlag(1); e.preventDefault();
+    nextActiveThread(1); e.preventDefault();
   } else if (e.key === 'N' || (e.key === 'n' && e.shiftKey)) {
-    nextFlag(-1); e.preventDefault();
+    nextActiveThread(-1); e.preventDefault();
   }
 });
 
-// Called by Swift
-window.mdReview = {
+// ─── Swift bridge ──────────────────────────────────────────────────────────────
+window.hr = {
   applyState(payload) {
     state.blocks = splitBlocks(payload.source || '');
     state.comments = payload.comments || [];

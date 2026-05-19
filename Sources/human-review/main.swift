@@ -9,48 +9,20 @@ setlinebuf(stdout)
 
 // MARK: - Model
 
-enum CommentKind: String, Codable {
-    case comment   // human-authored review note
-    case flag      // agent-authored "needs review" marker
-}
-
+/// A single comment. Threads are formed by `replyTo` pointers — a root is a
+/// comment with `replyTo == nil`. Only the root carries authoritative
+/// `anchorLine` / `anchorText` / `resolved` / `orphaned` values; replies
+/// inherit at render time.
 struct Comment: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
-    var anchorLine: Int        // 0-indexed line in source where the anchored block starts
-    var anchorText: String     // First ~80 chars of the block, used for reload re-anchoring
+    var replyTo: UUID? = nil
+    var anchorLine: Int
+    var anchorText: String
     var body: String
     var author: String
     var createdAt: Date = Date()
-    var orphaned: Bool = false // true if a reload could not relocate anchorText
-    var kind: CommentKind = .comment
-
-    enum CodingKeys: String, CodingKey {
-        case id, anchorLine, anchorText, body, author, createdAt, orphaned, kind
-    }
-    init(id: UUID = UUID(), anchorLine: Int, anchorText: String, body: String,
-         author: String, createdAt: Date = Date(), orphaned: Bool = false,
-         kind: CommentKind = .comment) {
-        self.id = id
-        self.anchorLine = anchorLine
-        self.anchorText = anchorText
-        self.body = body
-        self.author = author
-        self.createdAt = createdAt
-        self.orphaned = orphaned
-        self.kind = kind
-    }
-    // Custom decoder so older sidecars (no `orphaned` / `kind` fields) load cleanly.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try c.decode(UUID.self, forKey: .id)
-        self.anchorLine = try c.decode(Int.self, forKey: .anchorLine)
-        self.anchorText = try c.decode(String.self, forKey: .anchorText)
-        self.body = try c.decode(String.self, forKey: .body)
-        self.author = try c.decode(String.self, forKey: .author)
-        self.createdAt = try c.decode(Date.self, forKey: .createdAt)
-        self.orphaned = try c.decodeIfPresent(Bool.self, forKey: .orphaned) ?? false
-        self.kind = try c.decodeIfPresent(CommentKind.self, forKey: .kind) ?? .comment
-    }
+    var resolved: Bool = false
+    var orphaned: Bool = false
 }
 
 struct CommentFile: Codable {
@@ -70,18 +42,18 @@ struct FileSummary: Codable {
 }
 
 struct ReanchorStats: Codable {
-    let unchanged: Int   // anchorText found at same line
-    let relocated: Int   // anchorText found at a different line; anchorLine updated
-    let orphaned: Int    // anchorText not found anywhere; comment kept but flagged
+    let unchanged: Int
+    let relocated: Int
+    let orphaned: Int
 }
 
 struct StreamEvent: Codable {
-    let event: String              // "session_start" | "added" | "deleted" | "edited" | "reloaded" | "exit"
+    let event: String              // session_start | added | edited | deleted | resolved | reopened | reloaded | opened | focused | pong | exit
     let timestamp: Date
-    let file: String?              // nil for session-level events
+    let file: String?
     let comment: Comment?
-    let files: [FileSummary]?      // session_start / exit
-    let reanchor: ReanchorStats?   // reloaded
+    let files: [FileSummary]?
+    let reanchor: ReanchorStats?
 }
 
 extension String {
@@ -113,8 +85,6 @@ final class ReviewStore: ObservableObject {
     let exportURL: URL
     let author: String
     let streamToStdout: Bool
-    /// Hash of the source the current `comments[*].anchorLine` values are valid for.
-    /// reload() compares this against the disk source's hash to detect drift.
     private var anchoredSourceHash: String = ""
 
     init(fileURL: URL, streamToStdout: Bool) {
@@ -128,14 +98,14 @@ final class ReviewStore: ObservableObject {
         load()
     }
 
+    // MARK: I/O
+
     func load() {
         do {
             source = try String(contentsOf: fileURL, encoding: .utf8)
         } catch {
             source = "# Could not read \(fileURL.lastPathComponent)\n\n\(error.localizedDescription)"
         }
-        // Default: assume comments are anchored against the disk source unless the
-        // sidecar records a different hash (meaning the file drifted since save).
         anchoredSourceHash = source.sha256Prefix()
         if FileManager.default.fileExists(atPath: sidecarURL.path) {
             do {
@@ -143,7 +113,10 @@ final class ReviewStore: ObservableObject {
                 let dec = JSONDecoder()
                 dec.dateDecodingStrategy = .iso8601
                 let loaded = try dec.decode(CommentFile.self, from: data)
-                comments = loaded.comments.sorted { $0.anchorLine < $1.anchorLine }
+                // Sort by createdAt within thread, but list ordering doesn't matter
+                // — the renderer groups by replyTo. Keep them sorted by createdAt
+                // overall for stable display.
+                comments = loaded.comments.sorted { $0.createdAt < $1.createdAt }
                 anchoredSourceHash = loaded.sourceHash
             } catch {
                 statusMessage = "Failed to load sidecar: \(error.localizedDescription)"
@@ -152,7 +125,7 @@ final class ReviewStore: ObservableObject {
     }
 
     @discardableResult
-    func saveSidecar() -> Bool {
+    private func saveSidecar() -> Bool {
         let hash = source.sha256Prefix()
         let payload = CommentFile(
             file: fileURL.lastPathComponent,
@@ -164,7 +137,7 @@ final class ReviewStore: ObservableObject {
             enc.dateEncodingStrategy = .iso8601
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
             try enc.encode(payload).write(to: sidecarURL, options: .atomic)
-            anchoredSourceHash = hash  // comments now aligned with this source
+            anchoredSourceHash = hash
             return true
         } catch {
             statusMessage = "Save failed: \(error.localizedDescription)"
@@ -172,8 +145,6 @@ final class ReviewStore: ObservableObject {
         }
     }
 
-    /// Write inline `<basename>.review.md` with [!review] callouts after each anchored block.
-    /// If no comments, deletes any stale .review.md.
     func writeInlineExport() {
         guard !comments.isEmpty else {
             try? FileManager.default.removeItem(at: exportURL)
@@ -181,10 +152,16 @@ final class ReviewStore: ObservableObject {
         }
         let lines = source.components(separatedBy: "\n")
         var byAnchor: [Int: [Comment]] = [:]
-        for c in comments { byAnchor[c.anchorLine, default: []].append(c) }
+        for c in comments where !c.orphaned {
+            byAnchor[c.anchorLine, default: []].append(c)
+        }
 
         var insertions: [(afterLine: Int, text: String)] = []
+        let df = ISO8601DateFormatter()
+        df.formatOptions = [.withFullDate]
+
         for (start, cs) in byAnchor {
+            // Find end-of-block.
             var end = start
             var inFence = false
             for i in start..<lines.count {
@@ -193,21 +170,28 @@ final class ReviewStore: ObservableObject {
                     inFence.toggle()
                 }
                 if !inFence && line.trimmingCharacters(in: .whitespaces).isEmpty {
-                    end = i - 1
-                    break
+                    end = i - 1; break
                 }
                 end = i
             }
-            let df = ISO8601DateFormatter()
-            df.formatOptions = [.withFullDate]
+
+            // Group by thread (root) and render each as a callout chain.
+            let roots = cs.filter { $0.replyTo == nil }
             var block = ""
-            for c in cs.sorted(by: { $0.createdAt < $1.createdAt }) {
-                let when = df.string(from: c.createdAt)
-                let bodyLines = c.body
-                    .components(separatedBy: "\n")
-                    .map { "> \($0)" }
-                    .joined(separator: "\n")
-                block += "\n> [!review] \(c.author) · \(when)\n\(bodyLines)\n"
+            for root in roots.sorted(by: { $0.createdAt < $1.createdAt }) {
+                let allInThread = self.thread(rootedAt: root.id)
+                let resolvedMark = root.resolved ? " · ✓ resolved" : ""
+                block += "\n> [!review]\(resolvedMark)\n"
+                for (i, c) in allInThread.enumerated() {
+                    let when = df.string(from: c.createdAt)
+                    let prefix = i == 0 ? "" : "→ "
+                    let bodyLines = c.body
+                        .components(separatedBy: "\n")
+                        .map { "> \($0)" }
+                        .joined(separator: "\n")
+                    block += "> \(prefix)**\(c.author)** · \(when)\n\(bodyLines)\n"
+                    if i < allInThread.count - 1 { block += ">\n" }
+                }
             }
             insertions.append((afterLine: end, text: block))
         }
@@ -224,37 +208,89 @@ final class ReviewStore: ObservableObject {
     private func persist() {
         saveSidecar()
         writeInlineExport()
-        statusMessage = "Saved \(comments.count) comment\(comments.count == 1 ? "" : "s")"
     }
 
+    // MARK: Thread helpers
+
+    /// Walk replyTo upward until we reach a comment with replyTo == nil.
+    func rootId(of id: UUID) -> UUID? {
+        var current = comments.first { $0.id == id }
+        var visited: Set<UUID> = []
+        while let c = current, let parent = c.replyTo {
+            if visited.contains(c.id) { return nil }   // cycle guard
+            visited.insert(c.id)
+            current = comments.first { $0.id == parent }
+        }
+        return current?.id
+    }
+
+    /// All comments in the thread rooted at `rootId`, in chronological order
+    /// (root first).
+    func thread(rootedAt rootId: UUID) -> [Comment] {
+        guard let root = comments.first(where: { $0.id == rootId }) else { return [] }
+        var result = [root]
+        var frontier: [UUID] = [rootId]
+        var safety = 0
+        while !frontier.isEmpty && safety < 10_000 {
+            safety += 1
+            let next = frontier.removeFirst()
+            let children = comments.filter { $0.replyTo == next }
+            result.append(contentsOf: children)
+            frontier.append(contentsOf: children.map { $0.id })
+        }
+        return result.sorted { $0.createdAt < $1.createdAt }
+    }
+
+    var threadRoots: [Comment] {
+        comments.filter { $0.replyTo == nil }
+    }
+    var activeThreadRoots: [Comment] {
+        threadRoots.filter { !$0.resolved }
+    }
+
+    // MARK: Mutations
+
+    /// Add a new comment. If `replyTo` is set, anchorLine/anchorText are
+    /// copied from the thread root, and replying to a resolved thread auto-
+    /// reopens it. Returns the new comment.
     @discardableResult
     func addComment(line: Int, anchorText: String, body: String,
-                    kind: CommentKind = .comment, author: String? = nil) -> Comment {
-        let snippet = String(anchorText.prefix(80))
+                    replyTo: UUID? = nil, author: String? = nil) -> Comment? {
         let who = author ?? self.author
-        let c = Comment(anchorLine: line, anchorText: snippet, body: body,
-                        author: who, kind: kind)
-        comments.append(c)
-        comments.sort { $0.anchorLine < $1.anchorLine }
-        persist()
-        emit(event: kind == .flag ? "flagged" : "added", comment: c)
-        return c
-    }
-
-    @discardableResult
-    func addFlag(line: Int, anchorText: String, reason: String,
-                 author: String = "agent") -> Comment {
-        return addComment(line: line, anchorText: anchorText, body: reason,
-                          kind: .flag, author: author)
-    }
-
-    func deleteComment(_ id: UUID) {
-        guard let removed = comments.first(where: { $0.id == id }) else { return }
-        comments.removeAll { $0.id == id }
-        persist()
-        // Flag-kind comments are "resolved" rather than "deleted" — semantically the
-        // human (or agent) just marked the agent's flag as handled.
-        emit(event: removed.kind == .flag ? "resolved" : "deleted", comment: removed)
+        var c: Comment
+        if let parentId = replyTo {
+            guard let rootId = rootId(of: parentId),
+                  let root = comments.first(where: { $0.id == rootId }) else {
+                statusMessage = "Reply target not found: \(parentId)"
+                return nil
+            }
+            c = Comment(replyTo: parentId, anchorLine: root.anchorLine,
+                        anchorText: root.anchorText, body: body,
+                        author: who, resolved: false, orphaned: root.orphaned)
+            // Auto-reopen on reply.
+            var reopened = false
+            if root.resolved {
+                if let i = comments.firstIndex(where: { $0.id == root.id }) {
+                    comments[i].resolved = false
+                    reopened = true
+                }
+            }
+            comments.append(c)
+            persist()
+            emit(event: "added", comment: c)
+            if reopened, let r = comments.first(where: { $0.id == root.id }) {
+                emit(event: "reopened", comment: r)
+            }
+            return c
+        } else {
+            let snippet = String(anchorText.prefix(80))
+            c = Comment(replyTo: nil, anchorLine: line, anchorText: snippet,
+                        body: body, author: who)
+            comments.append(c)
+            persist()
+            emit(event: "added", comment: c)
+            return c
+        }
     }
 
     func editComment(_ id: UUID, body: String) {
@@ -264,8 +300,43 @@ final class ReviewStore: ObservableObject {
         emit(event: "edited", comment: comments[idx])
     }
 
-    /// Re-read source from disk and try to relocate every comment by searching for
-    /// its stored `anchorText`. Returns stats describing what moved.
+    /// Delete a single comment. If it's a thread root, the whole thread
+    /// (and any replies) is removed.
+    func deleteComment(_ id: UUID) {
+        guard let target = comments.first(where: { $0.id == id }) else { return }
+        if target.replyTo == nil {
+            // Root — remove whole thread.
+            let toRemove = thread(rootedAt: id).map { $0.id }
+            comments.removeAll { toRemove.contains($0.id) }
+        } else {
+            comments.removeAll { $0.id == id }
+        }
+        persist()
+        emit(event: "deleted", comment: target)
+    }
+
+    /// Resolve the thread that contains `id` (any descendant id works).
+    func resolveThread(_ id: UUID) {
+        guard let rootId = rootId(of: id) else { return }
+        guard let i = comments.firstIndex(where: { $0.id == rootId }) else { return }
+        if comments[i].resolved { return }   // idempotent
+        comments[i].resolved = true
+        persist()
+        emit(event: "resolved", comment: comments[i])
+    }
+
+    /// Reopen the thread that contains `id` (any descendant id works).
+    func reopenThread(_ id: UUID) {
+        guard let rootId = rootId(of: id) else { return }
+        guard let i = comments.firstIndex(where: { $0.id == rootId }) else { return }
+        if !comments[i].resolved { return }
+        comments[i].resolved = false
+        persist()
+        emit(event: "reopened", comment: comments[i])
+    }
+
+    // MARK: Reload (smart re-anchor)
+
     @discardableResult
     func reload() -> ReanchorStats {
         do {
@@ -275,38 +346,26 @@ final class ReviewStore: ObservableObject {
             return ReanchorStats(unchanged: 0, relocated: 0, orphaned: 0)
         }
 
-        // Fast path: comments are already anchored against this exact source.
         let diskHash = source.sha256Prefix()
         if diskHash == anchoredSourceHash {
+            let stats = ReanchorStats(unchanged: threadRoots.count, relocated: 0, orphaned: 0)
             statusMessage = "Reloaded — source unchanged"
-            let stats = ReanchorStats(unchanged: comments.count, relocated: 0, orphaned: 0)
-            if streamToStdout {
-                emitEvent(StreamEvent(
-                    event: "reloaded",
-                    timestamp: Date(),
-                    file: fileURL.path,
-                    comment: nil,
-                    files: nil,
-                    reanchor: stats
-                ))
-            }
+            emitReloaded(stats)
             return stats
         }
 
-        var unchanged = 0
-        var relocated = 0
-        var orphans = 0
+        var unchanged = 0, relocated = 0, orphans = 0
         let lines = source.components(separatedBy: "\n")
 
+        // Re-anchor only thread roots. Replies inherit their root's anchor.
         for i in 0..<comments.count {
+            guard comments[i].replyTo == nil else { continue }
             let original = comments[i].anchorLine
             let probe = comments[i].anchorText
-                .components(separatedBy: "\n")
-                .first?
+                .components(separatedBy: "\n").first?
                 .trimmingCharacters(in: .whitespaces) ?? ""
             guard !probe.isEmpty else { orphans += 1; comments[i].orphaned = true; continue }
 
-            // Find every line where the probe appears.
             let hits = lines.enumerated().compactMap { (idx, line) -> Int? in
                 line.trimmingCharacters(in: .whitespaces).hasPrefix(probe) ? idx : nil
             }
@@ -315,7 +374,6 @@ final class ReviewStore: ObservableObject {
                 orphans += 1
                 continue
             }
-            // Walk back to block start (previous blank line / BOF).
             var start = best
             while start > 0 && !lines[start - 1].trimmingCharacters(in: .whitespaces).isEmpty {
                 start -= 1
@@ -324,36 +382,40 @@ final class ReviewStore: ObservableObject {
             if start == original { unchanged += 1 }
             else { comments[i].anchorLine = start; relocated += 1 }
         }
-        comments.sort { $0.anchorLine < $1.anchorLine }
 
-        // Persist new anchors + regenerate .review.md against the new source.
+        // Sync replies' anchorLine to their root (cosmetic, for debugging).
+        let rootMap: [UUID: Comment] = Dictionary(uniqueKeysWithValues: comments
+            .filter { $0.replyTo == nil }.map { ($0.id, $0) })
+        for i in 0..<comments.count {
+            if comments[i].replyTo != nil,
+               let rid = rootId(of: comments[i].id),
+               let root = rootMap[rid] {
+                comments[i].anchorLine = root.anchorLine
+                comments[i].orphaned = root.orphaned
+            }
+        }
+
         saveSidecar()
         writeInlineExport()
-
         let stats = ReanchorStats(unchanged: unchanged, relocated: relocated, orphaned: orphans)
         statusMessage = "Reloaded · \(unchanged) unchanged · \(relocated) relocated · \(orphans) orphaned"
-        if streamToStdout {
-            emitEvent(StreamEvent(
-                event: "reloaded",
-                timestamp: Date(),
-                file: fileURL.path,
-                comment: nil,
-                files: nil,
-                reanchor: stats
-            ))
-        }
+        emitReloaded(stats)
         return stats
+    }
+
+    private func emitReloaded(_ stats: ReanchorStats) {
+        guard streamToStdout else { return }
+        emitEvent(StreamEvent(
+            event: "reloaded", timestamp: Date(), file: fileURL.path,
+            comment: nil, files: nil, reanchor: stats
+        ))
     }
 
     private func emit(event: String, comment: Comment?) {
         guard streamToStdout else { return }
         emitEvent(StreamEvent(
-            event: event,
-            timestamp: Date(),
-            file: fileURL.path,
-            comment: comment,
-            files: nil,
-            reanchor: nil
+            event: event, timestamp: Date(), file: fileURL.path,
+            comment: comment, files: nil, reanchor: nil
         ))
     }
 }
@@ -376,9 +438,7 @@ final class ReviewSession: ObservableObject {
         for url in urls {
             stores[url] = ReviewStore(fileURL: url, streamToStdout: stream)
         }
-        if stream {
-            emitSessionStart()
-        }
+        if stream { emitSessionStart() }
     }
 
     func store(at index: Int) -> ReviewStore { stores[urls[index]]! }
@@ -391,8 +451,6 @@ final class ReviewSession: ObservableObject {
     func next() { if canGoNext { currentIndex += 1 } }
     func previous() { if canGoPrev { currentIndex -= 1 } }
 
-    /// Append a file to the session at runtime. Returns the index of the
-    /// (possibly already-present) entry. Idempotent.
     @discardableResult
     func openFile(_ url: URL) -> Int {
         if let i = urls.firstIndex(of: url) { return i }
@@ -409,12 +467,8 @@ final class ReviewSession: ObservableObject {
 
     private func emitSessionStart() {
         emitEvent(StreamEvent(
-            event: "session_start",
-            timestamp: Date(),
-            file: nil,
-            comment: nil,
-            files: fileSummaries(),
-            reanchor: nil
+            event: "session_start", timestamp: Date(), file: nil,
+            comment: nil, files: fileSummaries(), reanchor: nil
         ))
     }
 
@@ -422,24 +476,16 @@ final class ReviewSession: ObservableObject {
         guard emitOnExit, !suppressExitEvent else { return }
         suppressExitEvent = true
         emitEvent(StreamEvent(
-            event: "exit",
-            timestamp: Date(),
-            file: nil,
-            comment: nil,
-            files: fileSummaries(),
-            reanchor: nil
+            event: "exit", timestamp: Date(), file: nil,
+            comment: nil, files: fileSummaries(), reanchor: nil
         ))
     }
 
     func emitFileEvent(_ event: String, file: URL) {
         guard stream else { return }
         emitEvent(StreamEvent(
-            event: event,
-            timestamp: Date(),
-            file: file.path,
-            comment: nil,
-            files: nil,
-            reanchor: nil
+            event: event, timestamp: Date(), file: file.path,
+            comment: nil, files: nil, reanchor: nil
         ))
     }
 
@@ -448,8 +494,7 @@ final class ReviewSession: ObservableObject {
         let payload: [String: Any] = [
             "event": "command_error",
             "timestamp": ISO8601DateFormatter().string(from: Date()),
-            "reason": reason,
-            "raw": raw
+            "reason": reason, "raw": raw
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload),
            let s = String(data: data, encoding: .utf8) {
@@ -464,29 +509,19 @@ final class ReviewSession: ObservableObject {
 
 // MARK: - Stdin command protocol
 
-/// Background reader that consumes one JSONL command per line from stdin.
-/// Active only when stdin is not a tty (i.e., the binary was launched with
-/// stdin piped from an agent). Idle when launched interactively.
 @MainActor
 final class CommandRouter {
     weak var session: ReviewSession?
 
     func start() {
-        // Don't read stdin when it's the controlling terminal — that'd swallow
-        // every keystroke the user types into the shell that launched us.
         if isatty(fileno(stdin)) != 0 { return }
-        let handle = FileHandle.standardInput
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            // Use readLine on stdin via fgets — straightforward, blocking, EOF-safe.
             while let line = Swift.readLine(strippingNewline: true) {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 if trimmed.isEmpty { continue }
-                DispatchQueue.main.async {
-                    self.handle(trimmed)
-                }
+                DispatchQueue.main.async { self.handle(trimmed) }
             }
-            _ = handle  // keep handle reference alive for the lifetime of the loop
         }
     }
 
@@ -498,71 +533,71 @@ final class CommandRouter {
             session.emitCommandError(raw, "could not parse JSON command")
             return
         }
-
-        switch cmd {
-        case "ping":
-            session.emitFileEvent("pong", file: URL(fileURLWithPath: ""))
-        case "flag":
-            do { try requireFile(session, obj) { store, line in
-                let reason = (obj["reason"] as? String) ?? (obj["body"] as? String) ?? ""
-                guard !reason.isEmpty else { throw CmdErr.missing("reason") }
-                let (start, text) = CLI.nearestBlock(in: store.source, around: max(0, line))
-                store.addFlag(line: start, anchorText: text, reason: reason)
-            }} catch { session.emitCommandError(raw, "\(error)") }
-        case "add":
-            do { try requireFile(session, obj) { store, line in
-                guard let body = obj["body"] as? String, !body.isEmpty else {
-                    throw CmdErr.missing("body")
-                }
-                let who = (obj["author"] as? String) ?? "agent"
-                let (start, text) = CLI.nearestBlock(in: store.source, around: max(0, line))
-                store.addComment(line: start, anchorText: text, body: body,
-                                 kind: .comment, author: who)
-            }} catch { session.emitCommandError(raw, "\(error)") }
-        case "resolve":
-            do {
+        do {
+            switch cmd {
+            case "ping":
+                session.emitFileEvent("pong", file: URL(fileURLWithPath: ""))
+            case "add":
                 let store = try resolveStore(session, obj)
-                guard let idStr = obj["id"] as? String, let id = UUID(uuidString: idStr) else {
-                    throw CmdErr.missing("id")
+                let body = (obj["body"] as? String) ?? ""
+                guard !body.isEmpty else { throw CmdErr.missing("body") }
+                let author = (obj["author"] as? String) ?? "agent"
+                let replyTo = (obj["replyTo"] as? String).flatMap { UUID(uuidString: $0) }
+                if replyTo != nil {
+                    store.addComment(line: 0, anchorText: "", body: body,
+                                     replyTo: replyTo, author: author)
+                } else {
+                    guard let line = obj["line"] as? Int else { throw CmdErr.missing("line") }
+                    let (start, text) = CLI.nearestBlock(in: store.source, around: max(0, line - 1))
+                    store.addComment(line: start, anchorText: text, body: body,
+                                     replyTo: nil, author: author)
                 }
+            case "resolve":
+                let store = try resolveStore(session, obj)
+                guard let idStr = obj["id"] as? String,
+                      let id = UUID(uuidString: idStr) else { throw CmdErr.missing("id") }
+                store.resolveThread(id)
+            case "reopen":
+                let store = try resolveStore(session, obj)
+                guard let idStr = obj["id"] as? String,
+                      let id = UUID(uuidString: idStr) else { throw CmdErr.missing("id") }
+                store.reopenThread(id)
+            case "delete":
+                let store = try resolveStore(session, obj)
+                guard let idStr = obj["id"] as? String,
+                      let id = UUID(uuidString: idStr) else { throw CmdErr.missing("id") }
                 store.deleteComment(id)
-            } catch { session.emitCommandError(raw, "\(error)") }
-        case "reload":
-            do {
-                let store = try resolveStore(session, obj)
-                store.reload()
-            } catch { session.emitCommandError(raw, "\(error)") }
-        case "open":
-            guard let path = obj["file"] as? String else {
-                session.emitCommandError(raw, "missing 'file'"); return
+            case "reload":
+                try resolveStore(session, obj).reload()
+            case "open":
+                guard let path = obj["file"] as? String else { throw CmdErr.missing("file") }
+                let url = CLI.resolveURL(path)
+                guard FileManager.default.fileExists(atPath: url.path) else {
+                    throw CmdErr.notInSession(path)
+                }
+                session.openFile(url)
+                session.emitFileEvent("opened", file: url)
+            case "focus":
+                guard let path = obj["file"] as? String else { throw CmdErr.missing("file") }
+                let url = CLI.resolveURL(path)
+                if session.focusFile(url) {
+                    session.emitFileEvent("focused", file: url)
+                } else {
+                    throw CmdErr.notInSession(path)
+                }
+            default:
+                throw CmdErr.unknown(cmd)
             }
-            let url = CLI.resolveURL(path)
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                session.emitCommandError(raw, "file not found: \(path)"); return
-            }
-            session.openFile(url)
-            session.emitFileEvent("opened", file: url)
-        case "focus":
-            guard let path = obj["file"] as? String else {
-                session.emitCommandError(raw, "missing 'file'"); return
-            }
-            let url = CLI.resolveURL(path)
-            if session.focusFile(url) {
-                session.emitFileEvent("focused", file: url)
-            } else {
-                session.emitCommandError(raw, "file not in session: \(path)")
-            }
-        default:
-            session.emitCommandError(raw, "unknown cmd: \(cmd)")
-        }
+        } catch { session.emitCommandError(raw, "\(error)") }
     }
 
     enum CmdErr: Error, CustomStringConvertible {
-        case missing(String), notInSession(String)
+        case missing(String), notInSession(String), unknown(String)
         var description: String {
             switch self {
             case .missing(let f): return "missing '\(f)'"
             case .notInSession(let p): return "file not in session: \(p)"
+            case .unknown(let c): return "unknown cmd: \(c)"
             }
         }
     }
@@ -572,15 +607,6 @@ final class CommandRouter {
         let url = CLI.resolveURL(path)
         guard let store = session.store(for: url) else { throw CmdErr.notInSession(path) }
         return store
-    }
-
-    private func requireFile(_ session: ReviewSession,
-                             _ obj: [String: Any],
-                             body: (ReviewStore, Int) throws -> Void) throws {
-        let store = try resolveStore(session, obj)
-        guard let line = obj["line"] as? Int else { throw CmdErr.missing("line") }
-        // Convert 1-indexed from agent to 0-indexed internally
-        try body(store, line - 1)
     }
 }
 
@@ -596,18 +622,29 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
         case "ready":
             onReady?()
         case "addComment":
-            guard let line = dict["line"] as? Int,
-                  let text = dict["text"] as? String,
-                  let body = dict["body"] as? String else { return }
-            Task { @MainActor in self.store?.addComment(line: line, anchorText: text, body: body) }
+            guard let body = dict["body"] as? String else { return }
+            let replyTo = (dict["replyTo"] as? String).flatMap { UUID(uuidString: $0) }
+            Task { @MainActor in
+                if replyTo != nil {
+                    self.store?.addComment(line: 0, anchorText: "", body: body, replyTo: replyTo, author: nil)
+                } else {
+                    guard let line = dict["line"] as? Int,
+                          let text = dict["text"] as? String else { return }
+                    self.store?.addComment(line: line, anchorText: text, body: body,
+                                           replyTo: nil, author: nil)
+                }
+            }
         case "deleteComment":
             if let idStr = dict["id"] as? String, let id = UUID(uuidString: idStr) {
                 Task { @MainActor in self.store?.deleteComment(id) }
             }
-        case "editComment":
-            if let idStr = dict["id"] as? String, let id = UUID(uuidString: idStr),
-               let body = dict["body"] as? String {
-                Task { @MainActor in self.store?.editComment(id, body: body) }
+        case "resolveThread":
+            if let idStr = dict["id"] as? String, let id = UUID(uuidString: idStr) {
+                Task { @MainActor in self.store?.resolveThread(id) }
+            }
+        case "reopenThread":
+            if let idStr = dict["id"] as? String, let id = UUID(uuidString: idStr) {
+                Task { @MainActor in self.store?.reopenThread(id) }
             }
         default:
             break
@@ -636,7 +673,7 @@ struct MarkdownWebView: NSViewRepresentable {
         if let url = Bundle.module.url(forResource: "viewer", withExtension: "html") {
             webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         } else {
-            webView.loadHTMLString("<h1>viewer.html missing from bundle</h1>", baseURL: nil)
+            webView.loadHTMLString("<h1>viewer.html missing</h1>", baseURL: nil)
         }
 
         context.coordinator.onReady = { [weak webView] in
@@ -657,7 +694,7 @@ struct MarkdownWebView: NSViewRepresentable {
         enc.dateEncodingStrategy = .iso8601
         guard let data = try? enc.encode(payload),
               let jsonStr = String(data: data, encoding: .utf8) else { return }
-        let js = "if (window.mdReview) { window.mdReview.applyState(\(jsonStr)); }"
+        let js = "if (window.hr) { window.hr.applyState(\(jsonStr)); }"
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 }
@@ -673,12 +710,10 @@ struct FileReviewView: View {
             Divider()
             HStack {
                 Text(store.statusMessage)
-                    .font(.caption).foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
-                Text("\(store.comments.count) comment\(store.comments.count == 1 ? "" : "s")")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
+                Text("\(store.threadRoots.count) thread\(store.threadRoots.count == 1 ? "" : "s")")
+                    .font(.caption.monospaced()).foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
         }
@@ -688,9 +723,7 @@ struct FileReviewView: View {
 struct HeaderBar: View {
     @ObservedObject var session: ReviewSession
 
-    private var flagCount: Int {
-        session.current.comments.filter { $0.kind == .flag }.count
-    }
+    private var activeCount: Int { session.current.activeThreadRoots.count }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -703,25 +736,21 @@ struct HeaderBar: View {
             Text(session.urls[session.currentIndex].lastPathComponent)
                 .font(.headline)
                 .lineLimit(1).truncationMode(.middle)
-            if flagCount > 0 {
-                Text("🚩 \(flagCount)")
+            if activeCount > 0 {
+                Text("● \(activeCount) active")
                     .font(.caption.monospaced())
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(Color.yellow.opacity(0.25))
                     .cornerRadius(4)
-                    .help("\(flagCount) flag\(flagCount == 1 ? "" : "s") — press n / N to navigate")
+                    .help("\(activeCount) active thread\(activeCount == 1 ? "" : "s") — press n / N to navigate")
             }
             Spacer()
-            Button(action: { session.previous() }) {
-                Image(systemName: "chevron.left")
-            }
-            .disabled(!session.canGoPrev)
-            .help("Previous file (⌘[)")
+            Button(action: { session.previous() }) { Image(systemName: "chevron.left") }
+                .disabled(!session.canGoPrev)
+                .help("Previous file (⌘[)")
             if session.canGoNext {
-                Button(action: { session.next() }) {
-                    Image(systemName: "chevron.right")
-                }
-                .help("Next file (⌘])")
+                Button(action: { session.next() }) { Image(systemName: "chevron.right") }
+                    .help("Next file (⌘])")
             } else {
                 Button(action: { NSApp.terminate(nil) }) {
                     HStack(spacing: 4) {
@@ -746,7 +775,6 @@ struct SessionWindow: View {
         VStack(spacing: 0) {
             HeaderBar(session: session)
             Divider()
-            // .id forces SwiftUI to rebuild the subtree (incl. fresh WKWebView) when the file changes.
             FileReviewView(store: session.current)
                 .id(session.currentIndex)
         }
@@ -760,23 +788,21 @@ enum CLI {
         let args = Array(argv.dropFirst())
         guard !args.isEmpty else { printUsage(); return 2 }
 
-        // Subcommand routing (only when first arg is an exact subcommand keyword)
-        let subcommands: Set<String> = ["add", "flag", "list", "export", "delete", "resolve", "reload", "help", "-h", "--help"]
+        let subcommands: Set<String> = ["add", "list", "export", "delete", "resolve", "reopen", "reload", "help", "-h", "--help"]
         if subcommands.contains(args[0]) {
             switch args[0] {
             case "help", "-h", "--help": printUsage(); return 0
             case "add":     return cmdAdd(Array(args.dropFirst()))
-            case "flag":    return cmdFlag(Array(args.dropFirst()))
             case "list":    return cmdList(Array(args.dropFirst()))
             case "export":  return cmdExport(Array(args.dropFirst()))
             case "delete":  return cmdDelete(Array(args.dropFirst()))
-            case "resolve": return cmdDelete(Array(args.dropFirst()))   // same code path
+            case "resolve": return cmdResolve(Array(args.dropFirst()))
+            case "reopen":  return cmdReopen(Array(args.dropFirst()))
             case "reload":  return cmdReload(Array(args.dropFirst()))
             default: break
             }
         }
 
-        // GUI mode. Defaults: stream on, emit-on-exit on. Disable with --no-* flags.
         var stream = true
         var emitOnExit = true
         var filePaths: [String] = []
@@ -784,7 +810,7 @@ enum CLI {
             switch a {
             case "--no-stream":         stream = false
             case "--no-emit-on-exit":   emitOnExit = false
-            case "--stream":            stream = true        // explicit, kept for compat
+            case "--stream":            stream = true
             default:
                 if a.hasPrefix("--") {
                     FileHandle.standardError.write("unknown flag: \(a)\n".data(using: .utf8)!)
@@ -822,67 +848,98 @@ enum CLI {
           --no-stream                              Disable live JSONL events on stdout
           --no-emit-on-exit                        Disable final exit-summary event
 
+        Concepts:
+          A *comment* anchors to a markdown block. A *thread* is a comment + replies.
+          A thread is **active** (resolved=false) or **settled** (resolved=true).
+          Replying to a settled thread auto-reopens it.
+          n / N walks ACTIVE threads only — settled ones collapse and are skipped.
+
         Keyboard inside the window:
           ↑ / ↓  (or k / j)   Move focus between blocks
-          Enter               Open composer on focused block
-          n / N               Jump to next / previous flagged block (wraps)
-          Tab                 In composer: submit + auto-advance focus to next block
+          Enter               Open composer on focused block (starts a new thread)
+          n / N               Jump to next / previous ACTIVE thread (wraps)
+          Tab                 In composer: submit + auto-advance focus
           ⌘ Enter             In composer: submit (alternative)
           Esc                 Cancel open composer
           ⌘ ] / ⌘ [           Next / previous file
-          ⌘ R                 Reload current file's source from disk (smart re-anchor)
-          ⌘ W or click ✓ Exit Close window (fires `exit` event)
+          ⌘ R                 Reload current source from disk (smart re-anchor)
+          ⌘ W or ✓ Exit       Close window (fires `exit` event)
 
         ─── Headless subcommands (no GUI) ──────────────────────────────────────────────
-          human-review add    FILE.md --line N --body "TEXT"   [--author NAME]
-          human-review flag   FILE.md --line N --reason "TEXT" [--author NAME]
-          human-review list   FILE.md                          Pretty JSON of comments
-          human-review delete FILE.md --id UUID                (alias: resolve)
-          human-review export FILE.md                          Force-write FILE.review.md
-          human-review reload FILE.md                          Re-anchor after source edit
+          human-review add     FILE.md --line N --body "TEXT"   [--author NAME]
+          human-review add     FILE.md --reply-to UUID --body "TEXT"   [--author NAME]
+          human-review list    FILE.md                       Pretty JSON of comments
+          human-review delete  FILE.md --id UUID             Remove a comment (deletes whole thread if root)
+          human-review resolve FILE.md --id UUID             Settle the thread containing id
+          human-review reopen  FILE.md --id UUID             Un-settle the thread containing id
+          human-review export  FILE.md                       Force-write FILE.review.md
+          human-review reload  FILE.md                       Re-anchor after editing source
 
-          `--line N` is 1-indexed. The block at the *nearest* enclosing paragraph/
-          heading/code-block is used as the anchor — you don't have to land exactly.
+          `--line N` is 1-indexed and snaps to the nearest enclosing block.
+          `--reply-to UUID` may target ANY comment in a thread; we resolve to the root.
 
         ─── Duplex agent protocol (stdin JSONL, auto-on when stdin is piped) ───────────
         Commands you send (one JSON object per line):
-          {"cmd":"flag",    "file":"…", "line":N, "reason":"…"}     create 🚩 marker
-          {"cmd":"add",     "file":"…", "line":N, "body":"…"}        create regular comment
-          {"cmd":"resolve", "file":"…", "id":"UUID"}                 remove comment/flag
-          {"cmd":"reload",  "file":"…"}                              re-read source + re-anchor
-          {"cmd":"open",    "file":"…"}                              append file to running session
-          {"cmd":"focus",   "file":"…"}                              switch GUI to that file
-          {"cmd":"ping"}                                              liveness check → "pong"
+          {"cmd":"add",     "file":"…", "line":N, "body":"…"}                start new thread
+          {"cmd":"add",     "file":"…", "replyTo":"UUID", "body":"…"}        reply (auto-reopens if settled)
+          {"cmd":"resolve", "file":"…", "id":"UUID"}                          settle thread
+          {"cmd":"reopen",  "file":"…", "id":"UUID"}                          un-settle thread
+          {"cmd":"delete",  "file":"…", "id":"UUID"}                          remove comment (root → whole thread)
+          {"cmd":"reload",  "file":"…"}                                       re-read source + re-anchor
+          {"cmd":"open",    "file":"…"}                                       append file to running session
+          {"cmd":"focus",   "file":"…"}                                       switch GUI to that file
+          {"cmd":"ping"}                                                       liveness → "pong"
 
         Events you receive (one JSON object per line on stdout):
           session_start  {files:[{file, comments[]}]}            on launch
-          added          {file, comment}                         user/agent added a comment
-          flagged        {file, comment}                         agent added a flag-kind comment
-          edited         {file, comment}                         comment body changed
-          deleted        {file, comment}                         regular comment removed
-          resolved       {file, comment}                         flag-kind comment removed
+          added          {file, comment}                         new comment OR reply (check replyTo)
+          edited         {file, comment}                         body changed
+          deleted        {file, comment}                         comment (or whole thread if root) removed
+          resolved       {file, comment}                         thread root marked resolved
+          reopened       {file, comment}                         thread root un-resolved
           reloaded       {file, reanchor:{unchanged,relocated,orphaned}}
           opened         {file}                                  file appended to session
           focused        {file}                                  GUI switched to file
           pong           {}                                       reply to ping
-          command_error  {raw, reason}                           bad cmd or unknown file
+          command_error  {raw, reason}                           bad cmd / unknown file
           exit           {files:[{file, comments[]}]}            window closed — final state
 
         Comment record shape (same in events, sidecar, and `list` output):
-          {id:"UUID", anchorLine:N0 (0-indexed), anchorText:"first 80 chars of block",
-           body:"…", author:"…", createdAt:"ISO8601", kind:"comment"|"flag", orphaned:false}
+          {id:"UUID", replyTo:"UUID"|null, anchorLine:N0 (0-indexed),
+           anchorText:"first 80 chars of block", body:"…", author:"…",
+           createdAt:"ISO8601", resolved:bool, orphaned:bool}
+
+          replyTo == null → thread root; anchorLine/anchorText are authoritative.
+          replyTo != null → reply; anchor fields mirror the root.
 
         ─── Always-on side effects per file ────────────────────────────────────────────
           FILE.md.comments.json   canonical sidecar (kept atomically up-to-date)
-          FILE.review.md          inline-annotated copy with [!review] callouts after each block
+          FILE.review.md          inline markdown with [!review] callouts per thread
 
-        ─── Example: bidirectional agent flow ──────────────────────────────────────────
+        ─── Python client (recommended for agents) ─────────────────────────────────────
+        Skip the subprocess + reader-thread boilerplate. Drop `human_review.py`
+        from `clients/python/` of this repo next to your script:
+
+          from human_review import HumanReview
+
+          with HumanReview(["notes.md"]) as hr:
+              root = hr.add(file="notes.md", line=42,
+                            body="verify the claim about X")
+              reply = hr.wait_for_reply(root["id"], timeout=600)
+              if reply:
+                  hr.reply(file="notes.md", reply_to=root["id"],
+                           body=f"thanks {reply['author']}, resolving.")
+                  hr.resolve(file="notes.md", root_id=root["id"])
+
+        See `clients/python/example_basic.py` for a complete runnable example.
+
+        ─── Raw subprocess flow (when not using the Python client) ──────────────────────
           proc = Popen(["human-review", "a.md", "b.md"],
                        stdin=PIPE, stdout=PIPE, text=True, bufsize=1)
-          # send commands:
-          proc.stdin.write(json.dumps({"cmd":"flag","file":"a.md","line":42,
-                                       "reason":"verify"}) + "\\n"); proc.stdin.flush()
-          # read events line-by-line from proc.stdout, react to "resolved" / "added".
+          proc.stdin.write(json.dumps({"cmd":"add","file":"a.md","line":42,
+                                       "body":"verify the claim about X"}) + "\\n")
+          proc.stdin.flush()
+          # Then read proc.stdout line-by-line, JSON-decode, react to events.
 
         """
         FileHandle.standardError.write(msg.data(using: .utf8)!)
@@ -897,29 +954,33 @@ enum CLI {
         app.run()
     }
 
-    // MARK: - Headless subcommands
+    // MARK: - Subcommands
 
     static func cmdAdd(_ args: [String]) -> Int32 {
         guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
             FileHandle.standardError.write("missing <file>\n".data(using: .utf8)!); return 2
         }
-        let lineStr = flagValue(args, "--line") ?? ""
         let body = flagValue(args, "--body") ?? ""
-        guard let line = Int(lineStr) else {
-            FileHandle.standardError.write("--line is required (integer, 1-indexed)\n".data(using: .utf8)!); return 2
-        }
         guard !body.isEmpty else {
             FileHandle.standardError.write("--body is required\n".data(using: .utf8)!); return 2
         }
+        let author = flagValue(args, "--author")
         let url = resolveURL(file)
         guard FileManager.default.fileExists(atPath: url.path) else {
             FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
         }
         return MainActor.assumeIsolated {
             let store = ReviewStore(fileURL: url, streamToStdout: true)
-            let target = max(0, line - 1)
-            let (blockStart, blockText) = nearestBlock(in: store.source, around: target)
-            store.addComment(line: blockStart, anchorText: blockText, body: body)
+            if let replyStr = flagValue(args, "--reply-to"), let replyId = UUID(uuidString: replyStr) {
+                store.addComment(line: 0, anchorText: "", body: body, replyTo: replyId, author: author)
+            } else {
+                guard let lineStr = flagValue(args, "--line"), let line = Int(lineStr) else {
+                    FileHandle.standardError.write("--line is required (or --reply-to)\n".data(using: .utf8)!)
+                    return 2
+                }
+                let (start, text) = nearestBlock(in: store.source, around: max(0, line - 1))
+                store.addComment(line: start, anchorText: text, body: body, replyTo: nil, author: author)
+            }
             return 0
         }
     }
@@ -960,32 +1021,6 @@ enum CLI {
         }
     }
 
-    static func cmdFlag(_ args: [String]) -> Int32 {
-        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
-            FileHandle.standardError.write("missing <file>\n".data(using: .utf8)!); return 2
-        }
-        let lineStr = flagValue(args, "--line") ?? ""
-        let reason = flagValue(args, "--reason") ?? flagValue(args, "--body") ?? ""
-        guard let line = Int(lineStr) else {
-            FileHandle.standardError.write("--line is required (integer, 1-indexed)\n".data(using: .utf8)!); return 2
-        }
-        guard !reason.isEmpty else {
-            FileHandle.standardError.write("--reason (or --body) is required\n".data(using: .utf8)!); return 2
-        }
-        let author = flagValue(args, "--author") ?? "agent"
-        let url = resolveURL(file)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
-        }
-        return MainActor.assumeIsolated {
-            let store = ReviewStore(fileURL: url, streamToStdout: true)
-            let target = max(0, line - 1)
-            let (blockStart, blockText) = nearestBlock(in: store.source, around: target)
-            store.addFlag(line: blockStart, anchorText: blockText, reason: reason, author: author)
-            return 0
-        }
-    }
-
     static func cmdReload(_ args: [String]) -> Int32 {
         guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
             FileHandle.standardError.write("missing <file>\n".data(using: .utf8)!); return 2
@@ -1001,7 +1036,11 @@ enum CLI {
         }
     }
 
-    static func cmdDelete(_ args: [String]) -> Int32 {
+    static func cmdDelete(_ args: [String]) -> Int32 { mutateById(args) { @MainActor in $0.deleteComment($1) } }
+    static func cmdResolve(_ args: [String]) -> Int32 { mutateById(args) { @MainActor in $0.resolveThread($1) } }
+    static func cmdReopen(_ args: [String]) -> Int32 { mutateById(args) { @MainActor in $0.reopenThread($1) } }
+
+    private static func mutateById(_ args: [String], _ action: @MainActor @escaping (ReviewStore, UUID) -> Void) -> Int32 {
         guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
             FileHandle.standardError.write("missing <file>\n".data(using: .utf8)!); return 2
         }
@@ -1014,12 +1053,12 @@ enum CLI {
         }
         return MainActor.assumeIsolated {
             let store = ReviewStore(fileURL: url, streamToStdout: true)
-            store.deleteComment(id)
+            action(store, id)
             return 0
         }
     }
 
-    // MARK: - Helpers
+    // MARK: Helpers
 
     static func flagValue(_ args: [String], _ name: String) -> String? {
         guard let idx = args.firstIndex(of: name), idx + 1 < args.count else { return nil }
@@ -1059,9 +1098,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let router = CommandRouter()
     var window: NSWindow?
 
-    init(session: ReviewSession) {
-        self.session = session
-    }
+    init(session: ReviewSession) { self.session = session }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let root = SessionWindow(session: session)
@@ -1080,40 +1117,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         router.start()
     }
 
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ notification: Notification) { session.emitExit() }
+
     private var sigTerm: DispatchSourceSignal?
     private var sigInt: DispatchSourceSignal?
 
     func installSignalHandlers() {
-        // Route SIGTERM/SIGINT through Cocoa's normal teardown so applicationWillTerminate fires.
         let onSignal: () -> Void = { [weak self] in
             self?.session.emitExit()
-            // Suppress the duplicate from applicationWillTerminate.
             self?.session.suppressExitEvent = true
             NSApp.terminate(nil)
         }
         signal(SIGTERM, SIG_IGN)
         let st = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        st.setEventHandler(handler: onSignal)
-        st.resume()
-        sigTerm = st
+        st.setEventHandler(handler: onSignal); st.resume(); sigTerm = st
 
         signal(SIGINT, SIG_IGN)
         let si = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        si.setEventHandler(handler: onSignal)
-        si.resume()
-        sigInt = si
-    }
-
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        session.emitExit()
+        si.setEventHandler(handler: onSignal); si.resume(); sigInt = si
     }
 
     func installMenu() {
         let main = NSMenu()
 
-        // App menu
         let appItem = NSMenuItem()
         main.addItem(appItem)
         let appMenu = NSMenu()
@@ -1122,20 +1149,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appItem.submenu = appMenu
 
-        // File menu — navigation only, no save/export
         let fileItem = NSMenuItem()
         main.addItem(fileItem)
         let fm = NSMenu(title: "File")
-        let next = NSMenuItem(title: "Next File", action: #selector(nextAction), keyEquivalent: "]")
-        next.target = self; fm.addItem(next)
-        let prev = NSMenuItem(title: "Previous File", action: #selector(prevAction), keyEquivalent: "[")
-        prev.target = self; fm.addItem(prev)
+        let nextI = NSMenuItem(title: "Next File", action: #selector(nextAction), keyEquivalent: "]")
+        nextI.target = self; fm.addItem(nextI)
+        let prevI = NSMenuItem(title: "Previous File", action: #selector(prevAction), keyEquivalent: "[")
+        prevI.target = self; fm.addItem(prevI)
         fm.addItem(NSMenuItem.separator())
         let r = NSMenuItem(title: "Reload Source", action: #selector(reloadAction), keyEquivalent: "r")
         r.target = self; fm.addItem(r)
         fileItem.submenu = fm
 
-        // Edit menu (so Cmd+C/V/A work in the composer)
         let editItem = NSMenuItem()
         main.addItem(editItem)
         let em = NSMenu(title: "Edit")
@@ -1158,4 +1183,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Entry
 
-exit(CLI.main(CommandLine.arguments))
+@MainActor
+func runApp() {
+    exit(CLI.main(CommandLine.arguments))
+}
+
+MainActor.assumeIsolated {
+    runApp()
+}
