@@ -72,6 +72,57 @@ func emitEvent(_ ev: StreamEvent) {
     }
 }
 
+/// Append a single JSON event to the per-file event log (FILE.md.events.jsonl).
+/// Best-effort: never throws, never crashes the caller on log write failure.
+enum EventLog {
+    static func append(_ ev: StreamEvent, for fileURL: URL) {
+        let logURL = fileURL.appendingPathExtension("events.jsonl")
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        guard var data = try? enc.encode(ev) else { return }
+        data.append(0x0A)  // newline
+        do {
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                try data.write(to: logURL)
+            } else {
+                let h = try FileHandle(forWritingTo: logURL)
+                try h.seekToEnd()
+                try h.write(contentsOf: data)
+                try h.close()
+            }
+        } catch {
+            // intentionally swallowed — log write must never break a mutation
+        }
+    }
+
+    static func appendRaw(_ obj: [String: Any], for fileURL: URL) {
+        let logURL = fileURL.appendingPathExtension("events.jsonl")
+        guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        data.append(0x0A)
+        do {
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                try data.write(to: logURL)
+            } else {
+                let h = try FileHandle(forWritingTo: logURL)
+                try h.seekToEnd()
+                try h.write(contentsOf: data)
+                try h.close()
+            }
+        } catch { }
+    }
+
+    static func truncate(for fileURL: URL) throws {
+        let logURL = fileURL.appendingPathExtension("events.jsonl")
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            try Data().write(to: logURL)
+        }
+    }
+
+    static func logURL(for fileURL: URL) -> URL {
+        fileURL.appendingPathExtension("events.jsonl")
+    }
+}
+
 // MARK: - Store (single file)
 
 @MainActor
@@ -86,6 +137,10 @@ final class ReviewStore: ObservableObject {
     let author: String
     let streamToStdout: Bool
     private var anchoredSourceHash: String = ""
+    /// SHA256 of the last sidecar payload we wrote. Used to ignore our own
+    /// writes when polling for external mutations.
+    private var lastWrittenSidecarHash: String = ""
+    private var sidecarPollTimer: DispatchSourceTimer?
 
     init(fileURL: URL, streamToStdout: Bool) {
         self.fileURL = fileURL
@@ -96,6 +151,45 @@ final class ReviewStore: ObservableObject {
         self.author = full.isEmpty ? NSUserName() : full
         self.streamToStdout = streamToStdout
         load()
+        if streamToStdout {
+            // Only start polling in GUI/duplex sessions. One-shot CLI invocations
+            // build a transient ReviewStore and don't need a watcher.
+            startSidecarPolling()
+        }
+    }
+
+    deinit {
+        sidecarPollTimer?.cancel()
+    }
+
+    /// Watch the sidecar JSON for external mutations (e.g., another process
+    /// running `human-review add`). Re-loads comments + re-renders when the
+    /// file content's SHA differs from what we last wrote.
+    private func startSidecarPolling() {
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        t.setEventHandler { [weak self] in self?.checkSidecarForExternalChange() }
+        t.resume()
+        sidecarPollTimer = t
+    }
+
+    private func checkSidecarForExternalChange() {
+        guard FileManager.default.fileExists(atPath: sidecarURL.path) else { return }
+        guard let data = try? Data(contentsOf: sidecarURL) else { return }
+        let h = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        if h == lastWrittenSidecarHash { return }  // our own write — ignore
+        // External update — adopt it.
+        do {
+            let dec = JSONDecoder()
+            dec.dateDecodingStrategy = .iso8601
+            let loaded = try dec.decode(CommentFile.self, from: data)
+            comments = loaded.comments.sorted { $0.createdAt < $1.createdAt }
+            anchoredSourceHash = loaded.sourceHash
+            lastWrittenSidecarHash = h
+            statusMessage = "External update · \(comments.count) comments"
+        } catch {
+            statusMessage = "External sidecar change but decode failed"
+        }
     }
 
     // MARK: I/O
@@ -136,8 +230,13 @@ final class ReviewStore: ObservableObject {
             let enc = JSONEncoder()
             enc.dateEncodingStrategy = .iso8601
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try enc.encode(payload).write(to: sidecarURL, options: .atomic)
+            let data = try enc.encode(payload)
+            try data.write(to: sidecarURL, options: .atomic)
             anchoredSourceHash = hash
+            // Record what we just wrote so the poll loop doesn't echo our own write
+            // back as an "external change".
+            lastWrittenSidecarHash = SHA256.hash(data: data)
+                .map { String(format: "%02x", $0) }.joined()
             return true
         } catch {
             statusMessage = "Save failed: \(error.localizedDescription)"
@@ -404,19 +503,22 @@ final class ReviewStore: ObservableObject {
     }
 
     private func emitReloaded(_ stats: ReanchorStats) {
-        guard streamToStdout else { return }
-        emitEvent(StreamEvent(
+        let ev = StreamEvent(
             event: "reloaded", timestamp: Date(), file: fileURL.path,
             comment: nil, files: nil, reanchor: stats
-        ))
+        )
+        // Always append to per-file event log so headless agents see it.
+        EventLog.append(ev, for: fileURL)
+        if streamToStdout { emitEvent(ev) }
     }
 
     private func emit(event: String, comment: Comment?) {
-        guard streamToStdout else { return }
-        emitEvent(StreamEvent(
+        let ev = StreamEvent(
             event: event, timestamp: Date(), file: fileURL.path,
             comment: comment, files: nil, reanchor: nil
-        ))
+        )
+        EventLog.append(ev, for: fileURL)
+        if streamToStdout { emitEvent(ev) }
     }
 }
 
@@ -456,6 +558,14 @@ final class ReviewSession: ObservableObject {
         if let i = urls.firstIndex(of: url) { return i }
         urls.append(url)
         stores[url] = ReviewStore(fileURL: url, streamToStdout: stream)
+        // Per-file gui_opened so a brand-new file's watcher fires.
+        let perFile = StreamEvent(
+            event: "gui_opened", timestamp: Date(), file: url.path,
+            comment: nil,
+            files: [FileSummary(file: url.path, comments: stores[url]?.comments ?? [])],
+            reanchor: nil
+        )
+        EventLog.append(perFile, for: url)
         return urls.count - 1
     }
 
@@ -470,6 +580,16 @@ final class ReviewSession: ObservableObject {
             event: "session_start", timestamp: Date(), file: nil,
             comment: nil, files: fileSummaries(), reanchor: nil
         ))
+        // Per-file marker so `human-review watch FILE` sees a GUI come up.
+        for url in urls {
+            let perFile = StreamEvent(
+                event: "gui_opened", timestamp: Date(), file: url.path,
+                comment: nil,
+                files: [FileSummary(file: url.path, comments: stores[url]?.comments ?? [])],
+                reanchor: nil
+            )
+            EventLog.append(perFile, for: url)
+        }
     }
 
     func emitExit() {
@@ -479,6 +599,16 @@ final class ReviewSession: ObservableObject {
             event: "exit", timestamp: Date(), file: nil,
             comment: nil, files: fileSummaries(), reanchor: nil
         ))
+        // Per-file marker so `human-review wait FILE --exit` can fire.
+        for url in urls {
+            let perFile = StreamEvent(
+                event: "gui_closed", timestamp: Date(), file: url.path,
+                comment: nil,
+                files: [FileSummary(file: url.path, comments: stores[url]?.comments ?? [])],
+                reanchor: nil
+            )
+            EventLog.append(perFile, for: url)
+        }
     }
 
     func emitFileEvent(_ event: String, file: URL) {
@@ -788,7 +918,11 @@ enum CLI {
         let args = Array(argv.dropFirst())
         guard !args.isEmpty else { printUsage(); return 2 }
 
-        let subcommands: Set<String> = ["add", "list", "export", "delete", "resolve", "reopen", "reload", "help", "-h", "--help"]
+        let subcommands: Set<String> = [
+            "add", "list", "export", "delete", "resolve", "reopen", "reload",
+            "watch", "wait", "threads", "get", "prune",
+            "help", "-h", "--help"
+        ]
         if subcommands.contains(args[0]) {
             switch args[0] {
             case "help", "-h", "--help": printUsage(); return 0
@@ -799,6 +933,11 @@ enum CLI {
             case "resolve": return cmdResolve(Array(args.dropFirst()))
             case "reopen":  return cmdReopen(Array(args.dropFirst()))
             case "reload":  return cmdReload(Array(args.dropFirst()))
+            case "watch":   return cmdWatch(Array(args.dropFirst()))
+            case "wait":    return cmdWait(Array(args.dropFirst()))
+            case "threads": return cmdThreads(Array(args.dropFirst()))
+            case "get":     return cmdGet(Array(args.dropFirst()))
+            case "prune":   return cmdPrune(Array(args.dropFirst()))
             default: break
             }
         }
@@ -841,105 +980,121 @@ enum CLI {
     static func printUsage() {
         let msg = """
         human-review · GitHub-style review for local markdown files
-                       Designed for both humans (GUI) and agents (duplex JSONL on stdio).
+                       Native CLI for agents — every interaction is a shell command.
 
-        ─── GUI mode (default) ─────────────────────────────────────────────────────────
-          human-review FILE.md [FILE2.md ...]      Open review window over one or more files
-          --no-stream                              Disable live JSONL events on stdout
-          --no-emit-on-exit                        Disable final exit-summary event
-
-        Concepts:
+        ─── Concept ────────────────────────────────────────────────────────────────────
           A *comment* anchors to a markdown block. A *thread* is a comment + replies.
           A thread is **active** (resolved=false) or **settled** (resolved=true).
-          Replying to a settled thread auto-reopens it.
-          n / N walks ACTIVE threads only — settled ones collapse and are skipped.
+          Replying to a settled thread auto-reopens it. Everything is just a comment;
+          there is no separate "flag" kind.
+
+          Per source FILE.md, three sidecars are kept atomically in sync:
+            FILE.md.comments.json    canonical state (read by everyone)
+            FILE.md.events.jsonl     append-only event log (tail this for live updates)
+            FILE.review.md           inline-annotated markdown copy
+
+          All mutations — from the GUI window, from `human-review add`, from any other
+          process — write to all three. A running GUI auto-reloads when an external
+          process mutates the sidecar.
+
+        ─── GUI mode (for the human) ───────────────────────────────────────────────────
+          human-review FILE.md [FILE2.md ...]      Open review window
+          --no-stream                              Disable live events on stdout
+          --no-emit-on-exit                        Disable final exit-summary event
 
         Keyboard inside the window:
           ↑ / ↓  (or k / j)   Move focus between blocks
-          Enter               Open composer on focused block (starts a new thread)
+          Enter               Open composer (reply if block has active thread, else new)
           n / N               Jump to next / previous ACTIVE thread (wraps)
           Tab                 In composer: submit + auto-advance focus
           ⌘ Enter             In composer: submit (alternative)
           Esc                 Cancel open composer
           ⌘ ] / ⌘ [           Next / previous file
-          ⌘ R                 Reload current source from disk (smart re-anchor)
+          ⌘ R                 Reload source from disk (smart re-anchor)
           ⌘ W or ✓ Exit       Close window (fires `exit` event)
 
-        ─── Headless subcommands (no GUI) ──────────────────────────────────────────────
-          human-review add     FILE.md --line N --body "TEXT"   [--author NAME]
-          human-review add     FILE.md --reply-to UUID --body "TEXT"   [--author NAME]
-          human-review list    FILE.md                       Pretty JSON of comments
-          human-review delete  FILE.md --id UUID             Remove a comment (deletes whole thread if root)
-          human-review resolve FILE.md --id UUID             Settle the thread containing id
-          human-review reopen  FILE.md --id UUID             Un-settle the thread containing id
-          human-review export  FILE.md                       Force-write FILE.review.md
-          human-review reload  FILE.md                       Re-anchor after editing source
+        ─── Agent CLI (for an LLM or a shell script) ──────────────────────────────────
+        Mutate. Each prints the resulting record (or {reanchor}) as JSON on stdout
+        and appends one line to FILE.md.events.jsonl.
 
-          `--line N` is 1-indexed and snaps to the nearest enclosing block.
-          `--reply-to UUID` may target ANY comment in a thread; we resolve to the root.
+          human-review add     FILE.md --line N    --body "TEXT" [--author NAME]
+          human-review add     FILE.md --reply-to UUID --body "TEXT" [--author NAME]
+          human-review resolve FILE.md --id UUID
+          human-review reopen  FILE.md --id UUID
+          human-review delete  FILE.md --id UUID
+          human-review reload  FILE.md
+          human-review export  FILE.md
 
-        ─── Duplex agent protocol (stdin JSONL, auto-on when stdin is piped) ───────────
-        Commands you send (one JSON object per line):
-          {"cmd":"add",     "file":"…", "line":N, "body":"…"}                start new thread
-          {"cmd":"add",     "file":"…", "replyTo":"UUID", "body":"…"}        reply (auto-reopens if settled)
-          {"cmd":"resolve", "file":"…", "id":"UUID"}                          settle thread
-          {"cmd":"reopen",  "file":"…", "id":"UUID"}                          un-settle thread
-          {"cmd":"delete",  "file":"…", "id":"UUID"}                          remove comment (root → whole thread)
-          {"cmd":"reload",  "file":"…"}                                       re-read source + re-anchor
-          {"cmd":"open",    "file":"…"}                                       append file to running session
-          {"cmd":"focus",   "file":"…"}                                       switch GUI to that file
-          {"cmd":"ping"}                                                       liveness → "pong"
+        Read.
 
-        Events you receive (one JSON object per line on stdout):
-          session_start  {files:[{file, comments[]}]}            on launch
-          added          {file, comment}                         new comment OR reply (check replyTo)
-          edited         {file, comment}                         body changed
-          deleted        {file, comment}                         comment (or whole thread if root) removed
-          resolved       {file, comment}                         thread root marked resolved
-          reopened       {file, comment}                         thread root un-resolved
-          reloaded       {file, reanchor:{unchanged,relocated,orphaned}}
-          opened         {file}                                  file appended to session
-          focused        {file}                                  GUI switched to file
-          pong           {}                                       reply to ping
-          command_error  {raw, reason}                           bad cmd / unknown file
-          exit           {files:[{file, comments[]}]}            window closed — final state
+          human-review list    FILE.md                  All comments as a JSON array
+          human-review threads FILE.md [--active|--settled]   Thread roots + reply counts
+          human-review get     FILE.md --id UUID        One comment as JSON
 
-        Comment record shape (same in events, sidecar, and `list` output):
+        Subscribe to live events (tails FILE.md.events.jsonl, blocks):
+
+          human-review watch   FILE.md [FILE2 ...] [--from-start] [--types LIST]
+              Defaults: emit every new event from now on. `--from-start` replays.
+              `--types added,resolved,...` filters event types.
+
+        Block-and-wait helpers (exit 0 on match, 124 on timeout):
+
+          human-review wait    FILE.md --reply-to UUID  [--from-author NAME] [--timeout S]
+              Blocks until any reply lands in the thread containing UUID.
+              Prints the matching event JSON on stdout.
+
+          human-review wait    FILE.md --resolve UUID                  [--timeout S]
+              Blocks until that thread is marked resolved.
+
+          human-review wait    FILE.md --exit                          [--timeout S]
+              Blocks until a GUI session closes for that file.
+
+        Housekeeping:
+
+          human-review prune   FILE.md                  Truncate events.jsonl
+          human-review --help                           This text
+
+        ─── Complete agent flow in pure shell ──────────────────────────────────────────
+          # Open a GUI for the human in the background
+          human-review notes.md &
+
+          # Post an inline review note, capture the thread root id
+          ROOT=$(human-review add notes.md --line 42 \\
+                   --body "verify the claim about X" | jq -r '.id')
+
+          # Block until the human replies (up to 10 minutes)
+          REPLY=$(human-review wait notes.md --reply-to "$ROOT" --timeout 600)
+          echo "human said: $(echo "$REPLY" | jq -r '.comment.body')"
+
+          # Send a follow-up and resolve
+          human-review add notes.md --reply-to "$ROOT" --body "thanks, addressed."
+          human-review resolve notes.md --id "$ROOT"
+
+        ─── Optional duplex stdin (when you DO have a long-lived parent process) ───────
+        If you spawn a GUI yourself and pipe JSONL into its stdin, the same
+        commands are accepted as stdin protocol — see `--types` and `wait`-style
+        usage in the watch subcommand for the equivalent shell-native flow.
+
+        Stdin commands (auto-active when stdin is piped):
+          {"cmd":"add","file":"…","line":N,"body":"…"} | {"cmd":"add","replyTo":"UUID",…}
+          {"cmd":"resolve","file":"…","id":"UUID"} | {"cmd":"reopen",…} | {"cmd":"delete",…}
+          {"cmd":"reload",…} | {"cmd":"open",…} | {"cmd":"focus",…} | {"cmd":"ping"}
+
+        ─── Event shapes ───────────────────────────────────────────────────────────────
+        Events in FILE.md.events.jsonl (and on GUI stdout):
+          gui_opened    {file, files:[{file, comments[]}]}    GUI started for that file
+          gui_closed    {file, files:[{file, comments[]}]}    GUI exited for that file
+          added         {file, comment}            new thread root OR reply (check replyTo)
+          edited        {file, comment}            body changed
+          deleted       {file, comment}            comment removed (root → whole thread)
+          resolved      {file, comment}            thread root settled
+          reopened      {file, comment}            thread root un-settled (manual or auto)
+          reloaded      {file, reanchor:{unchanged,relocated,orphaned}}
+
+        Comment record:
           {id:"UUID", replyTo:"UUID"|null, anchorLine:N0 (0-indexed),
            anchorText:"first 80 chars of block", body:"…", author:"…",
            createdAt:"ISO8601", resolved:bool, orphaned:bool}
-
-          replyTo == null → thread root; anchorLine/anchorText are authoritative.
-          replyTo != null → reply; anchor fields mirror the root.
-
-        ─── Always-on side effects per file ────────────────────────────────────────────
-          FILE.md.comments.json   canonical sidecar (kept atomically up-to-date)
-          FILE.review.md          inline markdown with [!review] callouts per thread
-
-        ─── Python client (recommended for agents) ─────────────────────────────────────
-        Skip the subprocess + reader-thread boilerplate. Drop `human_review.py`
-        from `clients/python/` of this repo next to your script:
-
-          from human_review import HumanReview
-
-          with HumanReview(["notes.md"]) as hr:
-              root = hr.add(file="notes.md", line=42,
-                            body="verify the claim about X")
-              reply = hr.wait_for_reply(root["id"], timeout=600)
-              if reply:
-                  hr.reply(file="notes.md", reply_to=root["id"],
-                           body=f"thanks {reply['author']}, resolving.")
-                  hr.resolve(file="notes.md", root_id=root["id"])
-
-        See `clients/python/example_basic.py` for a complete runnable example.
-
-        ─── Raw subprocess flow (when not using the Python client) ──────────────────────
-          proc = Popen(["human-review", "a.md", "b.md"],
-                       stdin=PIPE, stdout=PIPE, text=True, bufsize=1)
-          proc.stdin.write(json.dumps({"cmd":"add","file":"a.md","line":42,
-                                       "body":"verify the claim about X"}) + "\\n")
-          proc.stdin.flush()
-          # Then read proc.stdout line-by-line, JSON-decode, react to events.
 
         """
         FileHandle.standardError.write(msg.data(using: .utf8)!)
@@ -970,18 +1125,35 @@ enum CLI {
             FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
         }
         return MainActor.assumeIsolated {
-            let store = ReviewStore(fileURL: url, streamToStdout: true)
+            // One-shot CLI invocation — don't double-emit on stdout; we'll print
+            // the resulting comment JSON ourselves below.
+            let store = ReviewStore(fileURL: url, streamToStdout: false)
+            let result: Comment?
             if let replyStr = flagValue(args, "--reply-to"), let replyId = UUID(uuidString: replyStr) {
-                store.addComment(line: 0, anchorText: "", body: body, replyTo: replyId, author: author)
+                result = store.addComment(line: 0, anchorText: "", body: body, replyTo: replyId, author: author)
             } else {
                 guard let lineStr = flagValue(args, "--line"), let line = Int(lineStr) else {
                     FileHandle.standardError.write("--line is required (or --reply-to)\n".data(using: .utf8)!)
                     return 2
                 }
                 let (start, text) = nearestBlock(in: store.source, around: max(0, line - 1))
-                store.addComment(line: start, anchorText: text, body: body, replyTo: nil, author: author)
+                result = store.addComment(line: start, anchorText: text, body: body, replyTo: nil, author: author)
             }
+            guard let c = result else {
+                FileHandle.standardError.write("add failed\n".data(using: .utf8)!); return 1
+            }
+            printJSON(c)
             return 0
+        }
+    }
+
+    /// Pretty-print any Encodable as JSON to stdout.
+    static func printJSON<T: Encodable>(_ v: T) {
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? enc.encode(v), let s = String(data: data, encoding: .utf8) {
+            print(s)
         }
     }
 
@@ -1030,17 +1202,43 @@ enum CLI {
             FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
         }
         return MainActor.assumeIsolated {
-            let store = ReviewStore(fileURL: url, streamToStdout: true)
-            store.reload()
+            let store = ReviewStore(fileURL: url, streamToStdout: false)
+            let stats = store.reload()
+            printJSON(stats)
             return 0
         }
     }
 
-    static func cmdDelete(_ args: [String]) -> Int32 { mutateById(args) { @MainActor in $0.deleteComment($1) } }
-    static func cmdResolve(_ args: [String]) -> Int32 { mutateById(args) { @MainActor in $0.resolveThread($1) } }
-    static func cmdReopen(_ args: [String]) -> Int32 { mutateById(args) { @MainActor in $0.reopenThread($1) } }
+    static func cmdDelete(_ args: [String]) -> Int32 {
+        mutateAndPrintResult(args) { @MainActor store, id in
+            let target = store.comments.first(where: { $0.id == id })
+            store.deleteComment(id)
+            return target   // return the deleted comment as it was
+        }
+    }
+    static func cmdResolve(_ args: [String]) -> Int32 {
+        mutateAndPrintResult(args) { @MainActor store, id in
+            store.resolveThread(id)
+            if let rid = store.rootId(of: id) {
+                return store.comments.first(where: { $0.id == rid })
+            }
+            return nil
+        }
+    }
+    static func cmdReopen(_ args: [String]) -> Int32 {
+        mutateAndPrintResult(args) { @MainActor store, id in
+            store.reopenThread(id)
+            if let rid = store.rootId(of: id) {
+                return store.comments.first(where: { $0.id == rid })
+            }
+            return nil
+        }
+    }
 
-    private static func mutateById(_ args: [String], _ action: @MainActor @escaping (ReviewStore, UUID) -> Void) -> Int32 {
+    private static func mutateAndPrintResult(
+        _ args: [String],
+        _ action: @MainActor @escaping (ReviewStore, UUID) -> Comment?
+    ) -> Int32 {
         guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
             FileHandle.standardError.write("missing <file>\n".data(using: .utf8)!); return 2
         }
@@ -1052,11 +1250,296 @@ enum CLI {
             FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
         }
         return MainActor.assumeIsolated {
-            let store = ReviewStore(fileURL: url, streamToStdout: true)
-            action(store, id)
+            let store = ReviewStore(fileURL: url, streamToStdout: false)
+            let result = action(store, id)
+            if let c = result { printJSON(c) } else { print("null") }
             return 0
         }
     }
+
+    // MARK: - watch / wait / threads / get / prune
+
+    /// Tail one or more events.jsonl files; emit each new event to stdout as JSONL.
+    /// Defaults: from-now (not replay), all event types. --from-start replays from line 1.
+    /// --types=a,b,c filters event types.
+    static func cmdWatch(_ args: [String]) -> Int32 {
+        let files = args.filter { !$0.hasPrefix("--") && !($0 == typesValue(args)) }
+        guard !files.isEmpty else {
+            FileHandle.standardError.write("usage: human-review watch FILE.md [FILE2.md ...] [--from-start] [--types added,resolved,...]\n".data(using: .utf8)!)
+            return 2
+        }
+        let fromStart = args.contains("--from-start")
+        let typesFilter: Set<String>? = typesValue(args).map { Set($0.split(separator: ",").map(String.init)) }
+
+        let urls = files.map { resolveURL($0) }
+        let logPaths = urls.map { EventLog.logURL(for: $0).path }
+        // Ensure each log file exists so `tail -F` doesn't bail out.
+        for p in logPaths where !FileManager.default.fileExists(atPath: p) {
+            FileManager.default.createFile(atPath: p, contents: nil)
+        }
+
+        return tailAndFilter(logPaths: logPaths, fromStart: fromStart, typesFilter: typesFilter,
+                             stopOn: nil)
+    }
+
+    /// Block until a matching event lands. Mutually-exclusive modes:
+    ///   --reply-to UUID      first reply (any author) in that thread
+    ///   --resolve   UUID     thread is resolved
+    ///   --exit               GUI closes for that file
+    /// Prints the full matching event JSON on stdout and exits 0.
+    /// On --timeout T (seconds): exits 124 with no output.
+    static func cmdWait(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("usage: human-review wait FILE.md (--reply-to UUID | --resolve UUID | --exit) [--timeout S] [--from-start]\n".data(using: .utf8)!)
+            return 2
+        }
+        let replyTo  = flagValue(args, "--reply-to")
+        let resolve  = flagValue(args, "--resolve")
+        let waitExit = args.contains("--exit")
+        let fromAuthor = flagValue(args, "--from-author")
+        let timeout = flagValue(args, "--timeout").flatMap { Double($0) }
+        let fromStart = args.contains("--from-start")
+
+        let modes = [replyTo != nil, resolve != nil, waitExit].filter { $0 }.count
+        if modes != 1 {
+            FileHandle.standardError.write("exactly one of --reply-to, --resolve, --exit is required\n".data(using: .utf8)!)
+            return 2
+        }
+        let url = resolveURL(file)
+        let logPath = EventLog.logURL(for: url).path
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+        }
+
+        // Build predicate. For --reply-to, we discover thread membership as we go.
+        var threadIds: Set<String> = Set(replyTo.map { [$0] } ?? [])
+
+        let predicate: (String) -> Bool = { line in
+            guard let data = line.data(using: .utf8),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let ev = obj["event"] as? String else { return false }
+
+            if let target = resolve {
+                return ev == "resolved" && (obj["comment"] as? [String: Any])?["id"] as? String == target
+            }
+            if waitExit {
+                return ev == "gui_closed"
+            }
+            // reply-to mode
+            guard ev == "added", let c = obj["comment"] as? [String: Any] else { return false }
+            let parent = c["replyTo"] as? String
+            let id = c["id"] as? String
+            // Track thread membership: any descendant whose replyTo ∈ threadIds joins.
+            if let p = parent, threadIds.contains(p), let i = id { threadIds.insert(i) }
+            // Match: any reply whose parent ∈ threadIds, optionally filtered by author.
+            if let p = parent, threadIds.contains(p) {
+                if let want = fromAuthor, (c["author"] as? String) != want { return false }
+                return true
+            }
+            return false
+        }
+
+        return tailAndFilter(
+            logPaths: [logPath], fromStart: fromStart, typesFilter: nil,
+            stopOn: predicate, timeout: timeout,
+            printOnly: { line in true }
+        )
+    }
+
+    /// List thread roots for a file. Defaults: all roots. --active / --settled filter.
+    static func cmdThreads(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("usage: human-review threads FILE.md [--active|--settled]\n".data(using: .utf8)!)
+            return 2
+        }
+        let url = resolveURL(file)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
+        }
+        let onlyActive = args.contains("--active")
+        let onlySettled = args.contains("--settled")
+        return MainActor.assumeIsolated {
+            let store = ReviewStore(fileURL: url, streamToStdout: false)
+            var roots = store.threadRoots
+            if onlyActive  { roots = roots.filter { !$0.resolved } }
+            if onlySettled { roots = roots.filter {  $0.resolved } }
+
+            // Augment each with replyCount
+            let replyCounts: [UUID: Int] = Dictionary(grouping: store.comments.filter { $0.replyTo != nil },
+                                                       by: { store.rootId(of: $0.id) ?? $0.id })
+                .mapValues { $0.count }
+
+            struct ThreadSummary: Encodable {
+                let id: String
+                let anchorLine: Int
+                let anchorText: String
+                let body: String
+                let author: String
+                let createdAt: Date
+                let resolved: Bool
+                let orphaned: Bool
+                let replyCount: Int
+            }
+
+            let summaries = roots.map { r in
+                ThreadSummary(
+                    id: r.id.uuidString, anchorLine: r.anchorLine,
+                    anchorText: r.anchorText, body: r.body, author: r.author,
+                    createdAt: r.createdAt, resolved: r.resolved,
+                    orphaned: r.orphaned, replyCount: replyCounts[r.id] ?? 0
+                )
+            }
+            let enc = JSONEncoder()
+            enc.dateEncodingStrategy = .iso8601
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            if let data = try? enc.encode(summaries), let s = String(data: data, encoding: .utf8) {
+                print(s)
+            }
+            return 0
+        }
+    }
+
+    static func cmdGet(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("usage: human-review get FILE.md --id UUID\n".data(using: .utf8)!)
+            return 2
+        }
+        guard let idStr = flagValue(args, "--id"), let id = UUID(uuidString: idStr) else {
+            FileHandle.standardError.write("--id UUID required\n".data(using: .utf8)!); return 2
+        }
+        let url = resolveURL(file)
+        return MainActor.assumeIsolated {
+            let store = ReviewStore(fileURL: url, streamToStdout: false)
+            guard let c = store.comments.first(where: { $0.id == id }) else {
+                FileHandle.standardError.write("not found: \(idStr)\n".data(using: .utf8)!); return 1
+            }
+            let enc = JSONEncoder()
+            enc.dateEncodingStrategy = .iso8601
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            if let data = try? enc.encode(c), let s = String(data: data, encoding: .utf8) {
+                print(s)
+            }
+            return 0
+        }
+    }
+
+    static func cmdPrune(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("usage: human-review prune FILE.md\n".data(using: .utf8)!)
+            return 2
+        }
+        let url = resolveURL(file)
+        do {
+            try EventLog.truncate(for: url)
+            FileHandle.standardError.write("pruned \(EventLog.logURL(for: url).path)\n".data(using: .utf8)!)
+            return 0
+        } catch {
+            FileHandle.standardError.write("prune failed: \(error.localizedDescription)\n".data(using: .utf8)!)
+            return 1
+        }
+    }
+
+    // MARK: tail/filter engine
+
+    /// Spawn `tail -F` over the given log paths. For each line, optionally apply
+    /// a types-filter and a predicate that, when true, prints the line and exits.
+    /// timeout (seconds) → exit 124 if no match.
+    static func tailAndFilter(
+        logPaths: [String],
+        fromStart: Bool,
+        typesFilter: Set<String>?,
+        stopOn predicate: ((String) -> Bool)?,
+        timeout: Double? = nil,
+        printOnly: ((String) -> Bool)? = nil
+    ) -> Int32 {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
+        // -F follows + reopens on rename/truncate. -n 0 = from-now; -n +1 = replay-all.
+        var tailArgs: [String] = ["-F"]
+        tailArgs += fromStart ? ["-n", "+1"] : ["-n", "0"]
+        tailArgs += logPaths
+        task.arguments = tailArgs
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle(forWritingAtPath: "/dev/null") ?? FileHandle.standardError
+
+        do { try task.run() }
+        catch {
+            FileHandle.standardError.write("failed to spawn tail: \(error)\n".data(using: .utf8)!)
+            return 1
+        }
+
+        let handle = pipe.fileHandleForReading
+        let group = DispatchGroup()
+        var matched = false
+        var leftover = ""
+        let exitCode = NSLock()
+        var resultCode: Int32 = 0
+
+        // Optional timeout
+        var timer: DispatchSourceTimer?
+        if let t = timeout {
+            let dt = DispatchSource.makeTimerSource(queue: .global())
+            dt.schedule(deadline: .now() + t)
+            dt.setEventHandler {
+                exitCode.lock()
+                if !matched { resultCode = 124 }
+                exitCode.unlock()
+                task.terminate()
+            }
+            dt.resume()
+            timer = dt
+        }
+
+        group.enter()
+        handle.readabilityHandler = { fh in
+            let data = fh.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                group.leave()
+                return
+            }
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            leftover += text
+            while let nl = leftover.firstIndex(of: "\n") {
+                let line = String(leftover[..<nl])
+                leftover = String(leftover[leftover.index(after: nl)...])
+                if line.isEmpty { continue }
+
+                // Type filter (watch mode)
+                if let allowed = typesFilter {
+                    if let data = line.data(using: .utf8),
+                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                       let ev = obj["event"] as? String,
+                       !allowed.contains(ev) { continue }
+                }
+
+                let shouldPrint = printOnly?(line) ?? true
+                let stop = predicate?(line) ?? false
+                if stop {
+                    if shouldPrint { print(line); fflush(stdout) }
+                    exitCode.lock(); matched = true; exitCode.unlock()
+                    task.terminate()
+                    return
+                }
+                if shouldPrint && predicate == nil {
+                    print(line); fflush(stdout)
+                }
+            }
+        }
+
+        task.waitUntilExit()
+        // Drain
+        group.wait()
+        timer?.cancel()
+        exitCode.lock()
+        let code = resultCode
+        exitCode.unlock()
+        return code
+    }
+
+    static func typesValue(_ args: [String]) -> String? { flagValue(args, "--types") }
 
     // MARK: Helpers
 
