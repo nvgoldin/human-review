@@ -4,3 +4,5 @@ Package.resolved
 .DS_Store
 *.xcodeproj/
 xcuserdata/
+__pycache__/
+*.pyc
