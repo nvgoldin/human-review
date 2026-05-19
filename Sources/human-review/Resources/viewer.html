@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1d1d1f;
+    --bg: #ffffff;
+    --muted: #6e6e73;
+    --accent: #0a84ff;
+    --hover-bg: rgba(10,132,255,0.06);
+    --thread-bg: #f5f7fa;
+    --thread-border: #d2d6dc;
+    --code-bg: #f5f5f7;
+    --border: #d2d2d7;
+    --review-pill: #ff9f0a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #f5f5f7;
+      --bg: #1d1d1f;
+      --muted: #98989d;
+      --hover-bg: rgba(10,132,255,0.14);
+      --thread-bg: #2c2c2e;
+      --thread-border: #3a3a3c;
+      --code-bg: #2c2c2e;
+      --border: #3a3a3c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    font-size: 14.5px; line-height: 1.55;
+    color: var(--fg); background: var(--bg);
+  }
+  #content { max-width: 820px; margin: 0 auto; padding: 32px 24px 160px 64px; }
+
+  .block {
+    position: relative;
+    padding: 6px 10px;
+    margin: 4px -10px;
+    border-radius: 6px;
+  }
+  .block:hover { background: var(--hover-bg); }
+  /* Invisible pseudo-element extends the hover-tolerant zone to the left,
+     so the cursor can travel from the block to the [+] button without
+     leaving the hover area (which would hide the button mid-click). */
+  .block::before {
+    content: '';
+    position: absolute;
+    top: 0; bottom: 0;
+    left: -44px; width: 44px;
+  }
+
+  .block-body > :first-child { margin-top: 0; }
+  .block-body > :last-child { margin-bottom: 0; }
+
+  .add-btn {
+    position: absolute;
+    left: -38px; top: 4px;
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: white;
+    border: none;
+    font-size: 16px; font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    display: flex;
+    align-items: center; justify-content: center;
+    user-select: none;
+    padding: 0;
+    transition: opacity 0.1s ease-out, transform 0.08s ease-out;
+  }
+  /* Reveal when the block is hovered, OR when the button itself has hover/focus
+     (covers the moment the cursor sits exactly on the button after the block
+     loses hover state due to overlap quirks). */
+  .block:hover > .add-btn,
+  .add-btn:hover,
+  .add-btn:focus {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .add-btn:hover { transform: scale(1.08); }
+  .add-btn:active { transform: scale(0.95); }
+  .block.has-thread > .add-btn {
+    opacity: 1;
+    pointer-events: auto;
+    background: var(--review-pill);
+  }
+
+  /* Thread */
+  .thread {
+    margin-top: 8px;
+    border-left: 3px solid var(--review-pill);
+    background: var(--thread-bg);
+    border-radius: 6px;
+    padding: 4px 0;
+  }
+  .comment {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--thread-border);
+  }
+  .comment:last-child { border-bottom: none; }
+  .comment-head {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .comment-head .author { color: var(--fg); font-weight: 600; font-size: 12px; }
+  .comment-head .line {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    background: var(--accent); color: white;
+    padding: 1px 6px; border-radius: 3px;
+  }
+  .comment-head .spacer { flex: 1; }
+  .comment-head button {
+    background: transparent; border: none; color: var(--muted);
+    cursor: pointer; font-size: 11px; padding: 2px 6px;
+    border-radius: 3px;
+  }
+  .comment-head button:hover { background: rgba(0,0,0,0.06); color: var(--fg); }
+  @media (prefers-color-scheme: dark) {
+    .comment-head button:hover { background: rgba(255,255,255,0.08); }
+  }
+  .comment-body {
+    font-size: 13.5px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .comment-body p { margin: 0.3em 0; }
+
+  /* Composer */
+  .composer {
+    padding: 10px 12px;
+    border-top: 1px solid var(--thread-border);
+  }
+  .composer textarea {
+    width: 100%;
+    min-height: 64px;
+    font: inherit;
+    font-size: 13.5px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg);
+    resize: vertical;
+  }
+  .composer textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+  .composer-actions {
+    display: flex; gap: 8px; justify-content: flex-end;
+    margin-top: 6px;
+  }
+  .composer-actions button {
+    font: inherit; font-size: 13px;
+    padding: 4px 12px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .composer-actions button.primary {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .composer-actions button.primary:disabled {
+    opacity: 0.5; cursor: not-allowed;
+  }
+
+  /* Markdown content */
+  h1, h2, h3, h4, h5, h6 { margin: 1em 0 0.4em; line-height: 1.25; }
+  h1 { font-size: 2em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  h3 { font-size: 1.2em; }
+  p { margin: 0.5em 0; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.92em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; }
+  pre code { background: transparent; padding: 0; font-size: 0.88em; }
+  blockquote { margin: 0.5em 0; padding: 4px 14px; border-left: 3px solid var(--border); color: var(--muted); }
+  table { border-collapse: collapse; margin: 0.5em 0; }
+  table th, table td { border: 1px solid var(--border); padding: 6px 10px; }
+  ul, ol { padding-left: 1.6em; margin: 0.4em 0; }
+  li { margin: 0.15em 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 1.4em 0; }
+</style>
+<script src="marked.min.js"></script>
+</head>
+<body>
+<div id="content"></div>
+<script>
+'use strict';
+
+const state = {
+  blocks: [],          // [{start, text}]
+  comments: [],        // raw comment objects from Swift
+  activeComposer: null // line number with open composer
+};
+
+function splitBlocks(src) {
+  const lines = src.split('\n');
+  const blocks = [];
+  let cur = [];
+  let curStart = 0;
+  let inFence = false;
+  let fenceMarker = '';
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = line.match(/^(\s*)(```+|~~~+)/);
+    if (m) {
+      if (!inFence) { inFence = true; fenceMarker = m[2]; }
+      else if (line.includes(fenceMarker)) { inFence = false; }
+    }
+    const blank = line.trim() === '';
+    if (blank && !inFence) {
+      if (cur.length) { blocks.push({ start: curStart, text: cur.join('\n') }); cur = []; }
+      curStart = i + 1;
+    } else {
+      if (cur.length === 0) curStart = i;
+      cur.push(line);
+    }
+  }
+  if (cur.length) blocks.push({ start: curStart, text: cur.join('\n') });
+  return blocks;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+
+function commentsFor(line) {
+  return state.comments
+    .filter(c => c.anchorLine === line)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+}
+
+function postSwift(payload) {
+  if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.swift) {
+    window.webkit.messageHandlers.swift.postMessage(payload);
+  }
+}
+
+function renderComment(c) {
+  const dt = new Date(c.createdAt);
+  const date = dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return `
+    <div class="comment" data-id="${escapeHtml(c.id)}">
+      <div class="comment-head">
+        <span class="line">L${c.anchorLine + 1}</span>
+        <span class="author">${escapeHtml(c.author)}</span>
+        <span>${date}</span>
+        <span class="spacer"></span>
+        <button data-action="delete" data-id="${escapeHtml(c.id)}">Delete</button>
+      </div>
+      <div class="comment-body">${escapeHtml(c.body)}</div>
+    </div>
+  `;
+}
+
+function renderComposer(line, text) {
+  return `
+    <div class="composer" data-composer-line="${line}">
+      <textarea placeholder="Leave a comment on this block…" autofocus></textarea>
+      <div class="composer-actions">
+        <button data-action="cancel">Cancel</button>
+        <button class="primary" data-action="submit" data-line="${line}" data-text="${escapeHtml(text)}">Add comment</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderThread(b) {
+  const cs = commentsFor(b.start);
+  const showComposer = state.activeComposer === b.start;
+  if (!cs.length && !showComposer) return '';
+  let html = '<div class="thread">';
+  for (const c of cs) html += renderComment(c);
+  if (showComposer) html += renderComposer(b.start, b.text);
+  html += '</div>';
+  return html;
+}
+
+function render() {
+  const container = document.getElementById('content');
+  container.innerHTML = '';
+  for (const b of state.blocks) {
+    const div = document.createElement('div');
+    const cs = commentsFor(b.start);
+    div.className = 'block' + (cs.length ? ' has-thread' : '');
+    div.setAttribute('data-line', String(b.start));
+    div.innerHTML = `
+      <button class="add-btn" data-action="add" data-line="${b.start}" data-text="${escapeHtml(b.text)}" title="Add comment">+</button>
+      <div class="block-body">${marked.parse(b.text)}</div>
+      ${renderThread(b)}
+    `;
+    container.appendChild(div);
+  }
+  // Auto-focus composer textarea if one just opened
+  if (state.activeComposer !== null) {
+    const ta = document.querySelector(`.composer[data-composer-line="${state.activeComposer}"] textarea`);
+    if (ta) { ta.focus(); }
+  }
+}
+
+// Single delegated click handler
+document.addEventListener('click', (e) => {
+  const t = e.target;
+  if (!(t instanceof Element)) return;
+  const action = t.getAttribute('data-action');
+  if (!action) return;
+  e.stopPropagation();
+
+  if (action === 'add') {
+    const line = parseInt(t.getAttribute('data-line'), 10);
+    state.activeComposer = line;
+    render();
+    return;
+  }
+  if (action === 'cancel') {
+    state.activeComposer = null;
+    render();
+    return;
+  }
+  if (action === 'submit') {
+    const composer = t.closest('.composer');
+    const ta = composer.querySelector('textarea');
+    const body = (ta.value || '').trim();
+    if (!body) return;
+    const line = parseInt(t.getAttribute('data-line'), 10);
+    const text = t.getAttribute('data-text') || '';
+    postSwift({ type: 'addComment', line, text, body });
+    state.activeComposer = null;
+    // Note: Swift will push updated state back via applyState.
+    return;
+  }
+  if (action === 'delete') {
+    const id = t.getAttribute('data-id');
+    if (!id) return;
+    if (!confirm('Delete this comment?')) return;
+    postSwift({ type: 'deleteComment', id });
+    return;
+  }
+});
+
+// Submit shortcuts inside the composer:
+//   Tab            → submit (one-handed, no modifiers)
+//   Cmd/Ctrl+Enter → submit
+//   Escape         → cancel
+document.addEventListener('keydown', (e) => {
+  const inComposerTextarea =
+    e.target && e.target.tagName === 'TEXTAREA' && e.target.closest('.composer');
+  const isCmdEnter = (e.metaKey || e.ctrlKey) && e.key === 'Enter';
+  const isTabSubmit = e.key === 'Tab' && !e.shiftKey && inComposerTextarea;
+  const isEscape = e.key === 'Escape';
+
+  if (isCmdEnter || isTabSubmit) {
+    const btn = document.querySelector('.composer .primary[data-action="submit"]');
+    if (btn) { btn.click(); e.preventDefault(); }
+    return;
+  }
+  if (isEscape && state.activeComposer !== null) {
+    state.activeComposer = null;
+    render();
+    e.preventDefault();
+  }
+});
+
+// Called by Swift
+window.mdReview = {
+  applyState(payload) {
+    state.blocks = splitBlocks(payload.source || '');
+    state.comments = payload.comments || [];
+    render();
+  }
+};
+
+postSwift({ type: 'ready' });
+</script>
+</body>
+</html>
