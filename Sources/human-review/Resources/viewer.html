@@ -44,6 +44,14 @@
     border-radius: 6px;
   }
   .block:hover { background: var(--hover-bg); }
+  /* Keyboard-navigated focus (↑/↓ between blocks). Inset outline so adjacent
+     focused blocks don't cause layout shift. */
+  .block.focused {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    background: var(--hover-bg);
+  }
+  .block.focused > .add-btn { opacity: 1; pointer-events: auto; }
   /* Invisible pseudo-element extends the hover-tolerant zone to the left,
      so the cursor can travel from the block to the [+] button without
      leaving the hover area (which would hide the button mid-click). */
@@ -92,6 +100,17 @@
     pointer-events: auto;
     background: var(--review-pill);
   }
+  .block.has-flag > .add-btn {
+    background: #ffd60a;
+    color: #1d1d1f;
+  }
+
+  /* Flag-block pulse animation (lands here after n/N navigation) */
+  @keyframes flag-pulse {
+    0%, 100% { box-shadow: none; }
+    35%      { box-shadow: 0 0 0 4px rgba(255,214,10,0.55); }
+  }
+  .block.pulse { animation: flag-pulse 0.6s ease-out; }
 
   /* Thread */
   .thread {
@@ -101,9 +120,22 @@
     border-radius: 6px;
     padding: 4px 0;
   }
+  .thread.has-flag { border-left-color: #ffd60a; }
   .comment {
     padding: 8px 12px;
     border-bottom: 1px solid var(--thread-border);
+  }
+  .comment.flag {
+    background: rgba(255,214,10,0.10);
+  }
+  .comment.flag .comment-head .author::before {
+    content: "🚩 ";
+  }
+  .comment.flag .comment-head .author {
+    color: #b75d00;
+  }
+  @media (prefers-color-scheme: dark) {
+    .comment.flag .comment-head .author { color: #ffd60a; }
   }
   .comment:last-child { border-bottom: none; }
   .comment-head {
@@ -134,6 +166,16 @@
     word-wrap: break-word;
   }
   .comment-body p { margin: 0.3em 0; }
+
+  /* Orphaned comments section */
+  .orphan-section { margin-top: 40px; }
+  .orphan-title {
+    font-size: 13px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px; margin-bottom: 10px;
+  }
+  .orphan-thread { border-left-color: var(--muted); }
 
   /* Composer */
   .composer {
@@ -203,8 +245,39 @@
 const state = {
   blocks: [],          // [{start, text}]
   comments: [],        // raw comment objects from Swift
-  activeComposer: null // line number with open composer
+  activeComposer: null, // line number with open composer
+  focusedBlock: null   // line number of keyboard-focused block (null = none)
 };
+
+function focusedIndex() {
+  if (state.focusedBlock === null) return -1;
+  return state.blocks.findIndex(b => b.start === state.focusedBlock);
+}
+
+function moveFocus(delta) {
+  if (state.blocks.length === 0) return;
+  let idx = focusedIndex();
+  if (idx < 0) {
+    idx = delta > 0 ? 0 : state.blocks.length - 1;
+  } else {
+    idx = Math.max(0, Math.min(state.blocks.length - 1, idx + delta));
+  }
+  state.focusedBlock = state.blocks[idx].start;
+  render();
+  scrollFocusedIntoView();
+}
+
+function focusNext() {
+  const idx = focusedIndex();
+  if (idx >= 0 && idx + 1 < state.blocks.length) {
+    state.focusedBlock = state.blocks[idx + 1].start;
+  }
+}
+
+function scrollFocusedIntoView() {
+  const el = document.querySelector(`.block[data-line="${state.focusedBlock}"]`);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
 
 function splitBlocks(src) {
   const lines = src.split('\n');
@@ -254,14 +327,16 @@ function postSwift(payload) {
 function renderComment(c) {
   const dt = new Date(c.createdAt);
   const date = dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const isFlag = c.kind === 'flag';
+  const actionLabel = isFlag ? 'Resolve' : 'Delete';
   return `
-    <div class="comment" data-id="${escapeHtml(c.id)}">
+    <div class="comment ${isFlag ? 'flag' : ''}" data-id="${escapeHtml(c.id)}">
       <div class="comment-head">
         <span class="line">L${c.anchorLine + 1}</span>
         <span class="author">${escapeHtml(c.author)}</span>
         <span>${date}</span>
         <span class="spacer"></span>
-        <button data-action="delete" data-id="${escapeHtml(c.id)}">Delete</button>
+        <button data-action="delete" data-id="${escapeHtml(c.id)}">${actionLabel}</button>
       </div>
       <div class="comment-body">${escapeHtml(c.body)}</div>
     </div>
@@ -284,32 +359,108 @@ function renderThread(b) {
   const cs = commentsFor(b.start);
   const showComposer = state.activeComposer === b.start;
   if (!cs.length && !showComposer) return '';
-  let html = '<div class="thread">';
+  const hasFlag = cs.some(c => c.kind === 'flag');
+  let html = `<div class="thread${hasFlag ? ' has-flag' : ''}">`;
   for (const c of cs) html += renderComment(c);
   if (showComposer) html += renderComposer(b.start, b.text);
   html += '</div>';
   return html;
 }
 
+function flaggedLines() {
+  const lines = new Set();
+  for (const c of state.comments) if (c.kind === 'flag') lines.add(c.anchorLine);
+  return Array.from(lines).sort((a, b) => a - b);
+}
+
+function nextFlag(direction) {
+  const flags = flaggedLines();
+  if (flags.length === 0) return;
+  const cur = state.focusedBlock;
+  let target;
+  if (direction > 0) {
+    target = cur === null ? flags[0]
+           : (flags.find(l => l > cur) ?? flags[0]);
+  } else {
+    const before = flags.filter(l => l < (cur ?? Infinity));
+    target = before.length ? before[before.length - 1] : flags[flags.length - 1];
+  }
+  state.focusedBlock = target;
+  render();
+  scrollFocusedIntoView();
+  pulseBlock(target);
+}
+
+function pulseBlock(line) {
+  const el = document.querySelector(`.block[data-line="${line}"]`);
+  if (!el) return;
+  el.classList.remove('pulse');
+  // Force reflow so re-adding the class restarts the animation
+  void el.offsetWidth;
+  el.classList.add('pulse');
+  setTimeout(() => el.classList.remove('pulse'), 700);
+}
+
 function render() {
+  // Preserve scroll across the rebuild. Use replaceChildren() to swap content
+  // atomically — innerHTML = '' would momentarily collapse document height
+  // and trigger the browser to clamp scrollY to 0 (the "jumps to top" bug).
+  const scrollY = window.scrollY;
   const container = document.getElementById('content');
-  container.innerHTML = '';
+
+  const frag = document.createDocumentFragment();
   for (const b of state.blocks) {
     const div = document.createElement('div');
     const cs = commentsFor(b.start);
-    div.className = 'block' + (cs.length ? ' has-thread' : '');
+    const hasFlag = cs.some(c => c.kind === 'flag');
+    const classes = ['block'];
+    if (cs.length) classes.push('has-thread');
+    if (hasFlag) classes.push('has-flag');
+    if (state.focusedBlock === b.start) classes.push('focused');
+    div.className = classes.join(' ');
     div.setAttribute('data-line', String(b.start));
     div.innerHTML = `
       <button class="add-btn" data-action="add" data-line="${b.start}" data-text="${escapeHtml(b.text)}" title="Add comment">+</button>
       <div class="block-body">${marked.parse(b.text)}</div>
       ${renderThread(b)}
     `;
-    container.appendChild(div);
+    frag.appendChild(div);
   }
-  // Auto-focus composer textarea if one just opened
+
+  // Orphaned comments — anchorText not found after a reload.
+  const orphans = state.comments.filter(c => c.orphaned);
+  if (orphans.length) {
+    const sec = document.createElement('div');
+    sec.className = 'orphan-section';
+    sec.innerHTML = `<h3 class="orphan-title">⚠ Orphaned comments (source moved · re-anchor by hand)</h3>`;
+    const thread = document.createElement('div');
+    thread.className = 'thread orphan-thread';
+    for (const c of orphans) thread.innerHTML += renderComment(c);
+    sec.appendChild(thread);
+    frag.appendChild(sec);
+  }
+
+  container.replaceChildren(frag);
+
+  // Defensive: if scroll position got clamped anyway, restore it.
+  if (window.scrollY !== scrollY) window.scrollTo(0, scrollY);
+
+  // Auto-focus composer textarea if one just opened — preventScroll keeps the
+  // viewport pinned (default focus may scroll the textarea into view).
   if (state.activeComposer !== null) {
     const ta = document.querySelector(`.composer[data-composer-line="${state.activeComposer}"] textarea`);
-    if (ta) { ta.focus(); }
+    if (ta) {
+      ta.focus({ preventScroll: true });
+      // Make sure the composer is at least visible, but don't recenter aggressively.
+      const composer = ta.closest('.composer');
+      if (composer) {
+        const rect = composer.getBoundingClientRect();
+        const vh = window.innerHeight;
+        if (rect.bottom > vh || rect.top < 0) {
+          composer.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+        }
+      }
+    }
   }
 }
 
@@ -341,38 +492,67 @@ document.addEventListener('click', (e) => {
     const text = t.getAttribute('data-text') || '';
     postSwift({ type: 'addComment', line, text, body });
     state.activeComposer = null;
-    // Note: Swift will push updated state back via applyState.
+    // After submit, advance keyboard focus to the next block so Enter starts
+    // commenting on it immediately.
+    focusNext();
+    scrollFocusedIntoView();
+    // Swift will push updated state back via applyState.
     return;
   }
   if (action === 'delete') {
+    // Used for both "Delete" (regular comments) and "Resolve" (flags).
+    // No confirmation: the sidecar JSON keeps a record and the agent gets a
+    // resolved/deleted event in the stream — easy to undo if needed.
     const id = t.getAttribute('data-id');
     if (!id) return;
-    if (!confirm('Delete this comment?')) return;
     postSwift({ type: 'deleteComment', id });
     return;
   }
 });
 
-// Submit shortcuts inside the composer:
-//   Tab            → submit (one-handed, no modifiers)
-//   Cmd/Ctrl+Enter → submit
-//   Escape         → cancel
+// Keyboard model:
+//   ↑ / ↓          (no composer open)  Move focus between blocks
+//   Enter          (no composer open)  Open composer on focused block
+//   Tab            (composer open)     Submit + auto-advance focus to next block
+//   Cmd/Ctrl+Enter (composer open)     Submit (alternative)
+//   Escape         (composer open)     Cancel
 document.addEventListener('keydown', (e) => {
-  const inComposerTextarea =
-    e.target && e.target.tagName === 'TEXTAREA' && e.target.closest('.composer');
-  const isCmdEnter = (e.metaKey || e.ctrlKey) && e.key === 'Enter';
-  const isTabSubmit = e.key === 'Tab' && !e.shiftKey && inComposerTextarea;
-  const isEscape = e.key === 'Escape';
+  const inTextarea = e.target && e.target.tagName === 'TEXTAREA';
+  const inComposerTextarea = inTextarea && e.target.closest('.composer');
+  const composerOpen = state.activeComposer !== null;
 
-  if (isCmdEnter || isTabSubmit) {
-    const btn = document.querySelector('.composer .primary[data-action="submit"]');
-    if (btn) { btn.click(); e.preventDefault(); }
-    return;
+  // --- Composer-open actions ---
+  if (composerOpen) {
+    const isCmdEnter = (e.metaKey || e.ctrlKey) && e.key === 'Enter';
+    const isTabSubmit = e.key === 'Tab' && !e.shiftKey && inComposerTextarea;
+    if (isCmdEnter || isTabSubmit) {
+      const btn = document.querySelector('.composer .primary[data-action="submit"]');
+      if (btn) { btn.click(); e.preventDefault(); }
+      return;
+    }
+    if (e.key === 'Escape') {
+      state.activeComposer = null;
+      render();
+      e.preventDefault();
+      return;
+    }
+    return; // let other keys (typing, cursor movement) pass through to textarea
   }
-  if (isEscape && state.activeComposer !== null) {
-    state.activeComposer = null;
+
+  // --- Navigation (no composer, not inside any textarea) ---
+  if (inTextarea) return;
+  if (e.key === 'ArrowDown' || e.key === 'j') {
+    moveFocus(1); e.preventDefault();
+  } else if (e.key === 'ArrowUp' || e.key === 'k') {
+    moveFocus(-1); e.preventDefault();
+  } else if (e.key === 'Enter' && state.focusedBlock !== null) {
+    state.activeComposer = state.focusedBlock;
     render();
     e.preventDefault();
+  } else if (e.key === 'n' && !e.shiftKey) {
+    nextFlag(1); e.preventDefault();
+  } else if (e.key === 'N' || (e.key === 'n' && e.shiftKey)) {
+    nextFlag(-1); e.preventDefault();
   }
 });
 

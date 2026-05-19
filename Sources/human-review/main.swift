@@ -9,13 +9,48 @@ setlinebuf(stdout)
 
 // MARK: - Model
 
+enum CommentKind: String, Codable {
+    case comment   // human-authored review note
+    case flag      // agent-authored "needs review" marker
+}
+
 struct Comment: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
     var anchorLine: Int        // 0-indexed line in source where the anchored block starts
-    var anchorText: String     // First ~80 chars of the block, for visual context
+    var anchorText: String     // First ~80 chars of the block, used for reload re-anchoring
     var body: String
     var author: String
     var createdAt: Date = Date()
+    var orphaned: Bool = false // true if a reload could not relocate anchorText
+    var kind: CommentKind = .comment
+
+    enum CodingKeys: String, CodingKey {
+        case id, anchorLine, anchorText, body, author, createdAt, orphaned, kind
+    }
+    init(id: UUID = UUID(), anchorLine: Int, anchorText: String, body: String,
+         author: String, createdAt: Date = Date(), orphaned: Bool = false,
+         kind: CommentKind = .comment) {
+        self.id = id
+        self.anchorLine = anchorLine
+        self.anchorText = anchorText
+        self.body = body
+        self.author = author
+        self.createdAt = createdAt
+        self.orphaned = orphaned
+        self.kind = kind
+    }
+    // Custom decoder so older sidecars (no `orphaned` / `kind` fields) load cleanly.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.anchorLine = try c.decode(Int.self, forKey: .anchorLine)
+        self.anchorText = try c.decode(String.self, forKey: .anchorText)
+        self.body = try c.decode(String.self, forKey: .body)
+        self.author = try c.decode(String.self, forKey: .author)
+        self.createdAt = try c.decode(Date.self, forKey: .createdAt)
+        self.orphaned = try c.decodeIfPresent(Bool.self, forKey: .orphaned) ?? false
+        self.kind = try c.decodeIfPresent(CommentKind.self, forKey: .kind) ?? .comment
+    }
 }
 
 struct CommentFile: Codable {
@@ -34,12 +69,19 @@ struct FileSummary: Codable {
     let comments: [Comment]
 }
 
+struct ReanchorStats: Codable {
+    let unchanged: Int   // anchorText found at same line
+    let relocated: Int   // anchorText found at a different line; anchorLine updated
+    let orphaned: Int    // anchorText not found anywhere; comment kept but flagged
+}
+
 struct StreamEvent: Codable {
-    let event: String              // "session_start" | "added" | "deleted" | "edited" | "exit"
+    let event: String              // "session_start" | "added" | "deleted" | "edited" | "reloaded" | "exit"
     let timestamp: Date
     let file: String?              // nil for session-level events
     let comment: Comment?
-    let files: [FileSummary]?      // only for session_start / exit
+    let files: [FileSummary]?      // session_start / exit
+    let reanchor: ReanchorStats?   // reloaded
 }
 
 extension String {
@@ -71,6 +113,9 @@ final class ReviewStore: ObservableObject {
     let exportURL: URL
     let author: String
     let streamToStdout: Bool
+    /// Hash of the source the current `comments[*].anchorLine` values are valid for.
+    /// reload() compares this against the disk source's hash to detect drift.
+    private var anchoredSourceHash: String = ""
 
     init(fileURL: URL, streamToStdout: Bool) {
         self.fileURL = fileURL
@@ -89,6 +134,9 @@ final class ReviewStore: ObservableObject {
         } catch {
             source = "# Could not read \(fileURL.lastPathComponent)\n\n\(error.localizedDescription)"
         }
+        // Default: assume comments are anchored against the disk source unless the
+        // sidecar records a different hash (meaning the file drifted since save).
+        anchoredSourceHash = source.sha256Prefix()
         if FileManager.default.fileExists(atPath: sidecarURL.path) {
             do {
                 let data = try Data(contentsOf: sidecarURL)
@@ -96,6 +144,7 @@ final class ReviewStore: ObservableObject {
                 dec.dateDecodingStrategy = .iso8601
                 let loaded = try dec.decode(CommentFile.self, from: data)
                 comments = loaded.comments.sorted { $0.anchorLine < $1.anchorLine }
+                anchoredSourceHash = loaded.sourceHash
             } catch {
                 statusMessage = "Failed to load sidecar: \(error.localizedDescription)"
             }
@@ -104,9 +153,10 @@ final class ReviewStore: ObservableObject {
 
     @discardableResult
     func saveSidecar() -> Bool {
+        let hash = source.sha256Prefix()
         let payload = CommentFile(
             file: fileURL.lastPathComponent,
-            sourceHash: source.sha256Prefix(),
+            sourceHash: hash,
             comments: comments
         )
         do {
@@ -114,6 +164,7 @@ final class ReviewStore: ObservableObject {
             enc.dateEncodingStrategy = .iso8601
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
             try enc.encode(payload).write(to: sidecarURL, options: .atomic)
+            anchoredSourceHash = hash  // comments now aligned with this source
             return true
         } catch {
             statusMessage = "Save failed: \(error.localizedDescription)"
@@ -177,21 +228,33 @@ final class ReviewStore: ObservableObject {
     }
 
     @discardableResult
-    func addComment(line: Int, anchorText: String, body: String) -> Comment {
+    func addComment(line: Int, anchorText: String, body: String,
+                    kind: CommentKind = .comment, author: String? = nil) -> Comment {
         let snippet = String(anchorText.prefix(80))
-        let c = Comment(anchorLine: line, anchorText: snippet, body: body, author: author)
+        let who = author ?? self.author
+        let c = Comment(anchorLine: line, anchorText: snippet, body: body,
+                        author: who, kind: kind)
         comments.append(c)
         comments.sort { $0.anchorLine < $1.anchorLine }
         persist()
-        emit(event: "added", comment: c)
+        emit(event: kind == .flag ? "flagged" : "added", comment: c)
         return c
+    }
+
+    @discardableResult
+    func addFlag(line: Int, anchorText: String, reason: String,
+                 author: String = "agent") -> Comment {
+        return addComment(line: line, anchorText: anchorText, body: reason,
+                          kind: .flag, author: author)
     }
 
     func deleteComment(_ id: UUID) {
         guard let removed = comments.first(where: { $0.id == id }) else { return }
         comments.removeAll { $0.id == id }
         persist()
-        emit(event: "deleted", comment: removed)
+        // Flag-kind comments are "resolved" rather than "deleted" — semantically the
+        // human (or agent) just marked the agent's flag as handled.
+        emit(event: removed.kind == .flag ? "resolved" : "deleted", comment: removed)
     }
 
     func editComment(_ id: UUID, body: String) {
@@ -201,6 +264,87 @@ final class ReviewStore: ObservableObject {
         emit(event: "edited", comment: comments[idx])
     }
 
+    /// Re-read source from disk and try to relocate every comment by searching for
+    /// its stored `anchorText`. Returns stats describing what moved.
+    @discardableResult
+    func reload() -> ReanchorStats {
+        do {
+            source = try String(contentsOf: fileURL, encoding: .utf8)
+        } catch {
+            statusMessage = "Reload failed: \(error.localizedDescription)"
+            return ReanchorStats(unchanged: 0, relocated: 0, orphaned: 0)
+        }
+
+        // Fast path: comments are already anchored against this exact source.
+        let diskHash = source.sha256Prefix()
+        if diskHash == anchoredSourceHash {
+            statusMessage = "Reloaded — source unchanged"
+            let stats = ReanchorStats(unchanged: comments.count, relocated: 0, orphaned: 0)
+            if streamToStdout {
+                emitEvent(StreamEvent(
+                    event: "reloaded",
+                    timestamp: Date(),
+                    file: fileURL.path,
+                    comment: nil,
+                    files: nil,
+                    reanchor: stats
+                ))
+            }
+            return stats
+        }
+
+        var unchanged = 0
+        var relocated = 0
+        var orphans = 0
+        let lines = source.components(separatedBy: "\n")
+
+        for i in 0..<comments.count {
+            let original = comments[i].anchorLine
+            let probe = comments[i].anchorText
+                .components(separatedBy: "\n")
+                .first?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            guard !probe.isEmpty else { orphans += 1; comments[i].orphaned = true; continue }
+
+            // Find every line where the probe appears.
+            let hits = lines.enumerated().compactMap { (idx, line) -> Int? in
+                line.trimmingCharacters(in: .whitespaces).hasPrefix(probe) ? idx : nil
+            }
+            guard let best = hits.min(by: { abs($0 - original) < abs($1 - original) }) else {
+                comments[i].orphaned = true
+                orphans += 1
+                continue
+            }
+            // Walk back to block start (previous blank line / BOF).
+            var start = best
+            while start > 0 && !lines[start - 1].trimmingCharacters(in: .whitespaces).isEmpty {
+                start -= 1
+            }
+            comments[i].orphaned = false
+            if start == original { unchanged += 1 }
+            else { comments[i].anchorLine = start; relocated += 1 }
+        }
+        comments.sort { $0.anchorLine < $1.anchorLine }
+
+        // Persist new anchors + regenerate .review.md against the new source.
+        saveSidecar()
+        writeInlineExport()
+
+        let stats = ReanchorStats(unchanged: unchanged, relocated: relocated, orphaned: orphans)
+        statusMessage = "Reloaded · \(unchanged) unchanged · \(relocated) relocated · \(orphans) orphaned"
+        if streamToStdout {
+            emitEvent(StreamEvent(
+                event: "reloaded",
+                timestamp: Date(),
+                file: fileURL.path,
+                comment: nil,
+                files: nil,
+                reanchor: stats
+            ))
+        }
+        return stats
+    }
+
     private func emit(event: String, comment: Comment?) {
         guard streamToStdout else { return }
         emitEvent(StreamEvent(
@@ -208,7 +352,8 @@ final class ReviewStore: ObservableObject {
             timestamp: Date(),
             file: fileURL.path,
             comment: comment,
-            files: nil
+            files: nil,
+            reanchor: nil
         ))
     }
 }
@@ -218,26 +363,27 @@ final class ReviewStore: ObservableObject {
 @MainActor
 final class ReviewSession: ObservableObject {
     @Published var currentIndex: Int = 0
-    let urls: [URL]
+    @Published var urls: [URL]
     let stream: Bool
     let emitOnExit: Bool
     var suppressExitEvent: Bool = false
-    private var stores: [Int: ReviewStore] = [:]
+    private var stores: [URL: ReviewStore] = [:]
 
     init(urls: [URL], stream: Bool, emitOnExit: Bool) {
         self.urls = urls
         self.stream = stream
         self.emitOnExit = emitOnExit
-        for (i, url) in urls.enumerated() {
-            stores[i] = ReviewStore(fileURL: url, streamToStdout: stream)
+        for url in urls {
+            stores[url] = ReviewStore(fileURL: url, streamToStdout: stream)
         }
         if stream {
             emitSessionStart()
         }
     }
 
-    func store(at index: Int) -> ReviewStore { stores[index]! }
-    var current: ReviewStore { stores[currentIndex]! }
+    func store(at index: Int) -> ReviewStore { stores[urls[index]]! }
+    func store(for url: URL) -> ReviewStore? { stores[url] }
+    var current: ReviewStore { stores[urls[currentIndex]]! }
     var totalFiles: Int { urls.count }
     var canGoNext: Bool { currentIndex < urls.count - 1 }
     var canGoPrev: Bool { currentIndex > 0 }
@@ -245,32 +391,196 @@ final class ReviewSession: ObservableObject {
     func next() { if canGoNext { currentIndex += 1 } }
     func previous() { if canGoPrev { currentIndex -= 1 } }
 
+    /// Append a file to the session at runtime. Returns the index of the
+    /// (possibly already-present) entry. Idempotent.
+    @discardableResult
+    func openFile(_ url: URL) -> Int {
+        if let i = urls.firstIndex(of: url) { return i }
+        urls.append(url)
+        stores[url] = ReviewStore(fileURL: url, streamToStdout: stream)
+        return urls.count - 1
+    }
+
+    func focusFile(_ url: URL) -> Bool {
+        guard let i = urls.firstIndex(of: url) else { return false }
+        currentIndex = i
+        return true
+    }
+
     private func emitSessionStart() {
-        let summaries = (0..<urls.count).map { i in
-            FileSummary(file: urls[i].path, comments: stores[i]!.comments)
-        }
         emitEvent(StreamEvent(
             event: "session_start",
             timestamp: Date(),
             file: nil,
             comment: nil,
-            files: summaries
+            files: fileSummaries(),
+            reanchor: nil
         ))
     }
 
     func emitExit() {
         guard emitOnExit, !suppressExitEvent else { return }
         suppressExitEvent = true
-        let summaries = (0..<urls.count).map { i in
-            FileSummary(file: urls[i].path, comments: stores[i]!.comments)
-        }
         emitEvent(StreamEvent(
             event: "exit",
             timestamp: Date(),
             file: nil,
             comment: nil,
-            files: summaries
+            files: fileSummaries(),
+            reanchor: nil
         ))
+    }
+
+    func emitFileEvent(_ event: String, file: URL) {
+        guard stream else { return }
+        emitEvent(StreamEvent(
+            event: event,
+            timestamp: Date(),
+            file: file.path,
+            comment: nil,
+            files: nil,
+            reanchor: nil
+        ))
+    }
+
+    func emitCommandError(_ raw: String, _ reason: String) {
+        guard stream else { return }
+        let payload: [String: Any] = [
+            "event": "command_error",
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "reason": reason,
+            "raw": raw
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let s = String(data: data, encoding: .utf8) {
+            print(s); fflush(stdout)
+        }
+    }
+
+    private func fileSummaries() -> [FileSummary] {
+        urls.map { FileSummary(file: $0.path, comments: stores[$0]?.comments ?? []) }
+    }
+}
+
+// MARK: - Stdin command protocol
+
+/// Background reader that consumes one JSONL command per line from stdin.
+/// Active only when stdin is not a tty (i.e., the binary was launched with
+/// stdin piped from an agent). Idle when launched interactively.
+@MainActor
+final class CommandRouter {
+    weak var session: ReviewSession?
+
+    func start() {
+        // Don't read stdin when it's the controlling terminal — that'd swallow
+        // every keystroke the user types into the shell that launched us.
+        if isatty(fileno(stdin)) != 0 { return }
+        let handle = FileHandle.standardInput
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            // Use readLine on stdin via fgets — straightforward, blocking, EOF-safe.
+            while let line = Swift.readLine(strippingNewline: true) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty { continue }
+                DispatchQueue.main.async {
+                    self.handle(trimmed)
+                }
+            }
+            _ = handle  // keep handle reference alive for the lifetime of the loop
+        }
+    }
+
+    func handle(_ raw: String) {
+        guard let session = session else { return }
+        guard let data = raw.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let cmd = obj["cmd"] as? String else {
+            session.emitCommandError(raw, "could not parse JSON command")
+            return
+        }
+
+        switch cmd {
+        case "ping":
+            session.emitFileEvent("pong", file: URL(fileURLWithPath: ""))
+        case "flag":
+            do { try requireFile(session, obj) { store, line in
+                let reason = (obj["reason"] as? String) ?? (obj["body"] as? String) ?? ""
+                guard !reason.isEmpty else { throw CmdErr.missing("reason") }
+                let (start, text) = CLI.nearestBlock(in: store.source, around: max(0, line))
+                store.addFlag(line: start, anchorText: text, reason: reason)
+            }} catch { session.emitCommandError(raw, "\(error)") }
+        case "add":
+            do { try requireFile(session, obj) { store, line in
+                guard let body = obj["body"] as? String, !body.isEmpty else {
+                    throw CmdErr.missing("body")
+                }
+                let who = (obj["author"] as? String) ?? "agent"
+                let (start, text) = CLI.nearestBlock(in: store.source, around: max(0, line))
+                store.addComment(line: start, anchorText: text, body: body,
+                                 kind: .comment, author: who)
+            }} catch { session.emitCommandError(raw, "\(error)") }
+        case "resolve":
+            do {
+                let store = try resolveStore(session, obj)
+                guard let idStr = obj["id"] as? String, let id = UUID(uuidString: idStr) else {
+                    throw CmdErr.missing("id")
+                }
+                store.deleteComment(id)
+            } catch { session.emitCommandError(raw, "\(error)") }
+        case "reload":
+            do {
+                let store = try resolveStore(session, obj)
+                store.reload()
+            } catch { session.emitCommandError(raw, "\(error)") }
+        case "open":
+            guard let path = obj["file"] as? String else {
+                session.emitCommandError(raw, "missing 'file'"); return
+            }
+            let url = CLI.resolveURL(path)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                session.emitCommandError(raw, "file not found: \(path)"); return
+            }
+            session.openFile(url)
+            session.emitFileEvent("opened", file: url)
+        case "focus":
+            guard let path = obj["file"] as? String else {
+                session.emitCommandError(raw, "missing 'file'"); return
+            }
+            let url = CLI.resolveURL(path)
+            if session.focusFile(url) {
+                session.emitFileEvent("focused", file: url)
+            } else {
+                session.emitCommandError(raw, "file not in session: \(path)")
+            }
+        default:
+            session.emitCommandError(raw, "unknown cmd: \(cmd)")
+        }
+    }
+
+    enum CmdErr: Error, CustomStringConvertible {
+        case missing(String), notInSession(String)
+        var description: String {
+            switch self {
+            case .missing(let f): return "missing '\(f)'"
+            case .notInSession(let p): return "file not in session: \(p)"
+            }
+        }
+    }
+
+    private func resolveStore(_ session: ReviewSession, _ obj: [String: Any]) throws -> ReviewStore {
+        guard let path = obj["file"] as? String else { throw CmdErr.missing("file") }
+        let url = CLI.resolveURL(path)
+        guard let store = session.store(for: url) else { throw CmdErr.notInSession(path) }
+        return store
+    }
+
+    private func requireFile(_ session: ReviewSession,
+                             _ obj: [String: Any],
+                             body: (ReviewStore, Int) throws -> Void) throws {
+        let store = try resolveStore(session, obj)
+        guard let line = obj["line"] as? Int else { throw CmdErr.missing("line") }
+        // Convert 1-indexed from agent to 0-indexed internally
+        try body(store, line - 1)
     }
 }
 
@@ -378,6 +688,10 @@ struct FileReviewView: View {
 struct HeaderBar: View {
     @ObservedObject var session: ReviewSession
 
+    private var flagCount: Int {
+        session.current.comments.filter { $0.kind == .flag }.count
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             Text("\(session.currentIndex + 1) / \(session.totalFiles)")
@@ -389,6 +703,14 @@ struct HeaderBar: View {
             Text(session.urls[session.currentIndex].lastPathComponent)
                 .font(.headline)
                 .lineLimit(1).truncationMode(.middle)
+            if flagCount > 0 {
+                Text("🚩 \(flagCount)")
+                    .font(.caption.monospaced())
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.yellow.opacity(0.25))
+                    .cornerRadius(4)
+                    .help("\(flagCount) flag\(flagCount == 1 ? "" : "s") — press n / N to navigate")
+            }
             Spacer()
             Button(action: { session.previous() }) {
                 Image(systemName: "chevron.left")
@@ -439,14 +761,17 @@ enum CLI {
         guard !args.isEmpty else { printUsage(); return 2 }
 
         // Subcommand routing (only when first arg is an exact subcommand keyword)
-        let subcommands: Set<String> = ["add", "list", "export", "delete", "help", "-h", "--help"]
+        let subcommands: Set<String> = ["add", "flag", "list", "export", "delete", "resolve", "reload", "help", "-h", "--help"]
         if subcommands.contains(args[0]) {
             switch args[0] {
             case "help", "-h", "--help": printUsage(); return 0
-            case "add":    return cmdAdd(Array(args.dropFirst()))
-            case "list":   return cmdList(Array(args.dropFirst()))
-            case "export": return cmdExport(Array(args.dropFirst()))
-            case "delete": return cmdDelete(Array(args.dropFirst()))
+            case "add":     return cmdAdd(Array(args.dropFirst()))
+            case "flag":    return cmdFlag(Array(args.dropFirst()))
+            case "list":    return cmdList(Array(args.dropFirst()))
+            case "export":  return cmdExport(Array(args.dropFirst()))
+            case "delete":  return cmdDelete(Array(args.dropFirst()))
+            case "resolve": return cmdDelete(Array(args.dropFirst()))   // same code path
+            case "reload":  return cmdReload(Array(args.dropFirst()))
             default: break
             }
         }
@@ -502,10 +827,21 @@ enum CLI {
           Cmd+Enter submits the active composer, Esc cancels.
 
         Headless subcommands (no GUI):
-          human-review add <file.md> --line N --body "TEXT"
+          human-review add <file.md> --line N --body "TEXT" [--author NAME]
+          human-review flag <file.md> --line N --reason "TEXT" [--author NAME]
           human-review list <file.md>
-          human-review delete <file.md> --id UUID
+          human-review delete <file.md> --id UUID    (alias: resolve)
           human-review export <file.md>
+          human-review reload <file.md>   Re-anchor comments after editing source
+
+        Live agent control (stdin JSONL — only when stdin is piped):
+          {"cmd":"flag","file":"…","line":N,"reason":"…"}
+          {"cmd":"add","file":"…","line":N,"body":"…"}
+          {"cmd":"resolve","file":"…","id":"UUID"}
+          {"cmd":"reload","file":"…"}
+          {"cmd":"open","file":"…"}      (append a new file to the running session)
+          {"cmd":"focus","file":"…"}     (switch GUI to that file)
+          {"cmd":"ping"}                  (round-trip liveness — replies "pong")
 
         Always-on side effects per file:
           <file>.md.comments.json   sidecar store (canonical state)
@@ -587,6 +923,47 @@ enum CLI {
         }
     }
 
+    static func cmdFlag(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("missing <file>\n".data(using: .utf8)!); return 2
+        }
+        let lineStr = flagValue(args, "--line") ?? ""
+        let reason = flagValue(args, "--reason") ?? flagValue(args, "--body") ?? ""
+        guard let line = Int(lineStr) else {
+            FileHandle.standardError.write("--line is required (integer, 1-indexed)\n".data(using: .utf8)!); return 2
+        }
+        guard !reason.isEmpty else {
+            FileHandle.standardError.write("--reason (or --body) is required\n".data(using: .utf8)!); return 2
+        }
+        let author = flagValue(args, "--author") ?? "agent"
+        let url = resolveURL(file)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
+        }
+        return MainActor.assumeIsolated {
+            let store = ReviewStore(fileURL: url, streamToStdout: true)
+            let target = max(0, line - 1)
+            let (blockStart, blockText) = nearestBlock(in: store.source, around: target)
+            store.addFlag(line: blockStart, anchorText: blockText, reason: reason, author: author)
+            return 0
+        }
+    }
+
+    static func cmdReload(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("missing <file>\n".data(using: .utf8)!); return 2
+        }
+        let url = resolveURL(file)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
+        }
+        return MainActor.assumeIsolated {
+            let store = ReviewStore(fileURL: url, streamToStdout: true)
+            store.reload()
+            return 0
+        }
+    }
+
     static func cmdDelete(_ args: [String]) -> Int32 {
         guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
             FileHandle.standardError.write("missing <file>\n".data(using: .utf8)!); return 2
@@ -642,6 +1019,7 @@ enum CLI {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let session: ReviewSession
+    let router = CommandRouter()
     var window: NSWindow?
 
     init(session: ReviewSession) {
@@ -661,6 +1039,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.window = win
         installMenu()
         installSignalHandlers()
+        router.session = session
+        router.start()
     }
 
     private var sigTerm: DispatchSourceSignal?
@@ -736,7 +1116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func nextAction()   { session.next() }
     @objc func prevAction()   { session.previous() }
-    @objc func reloadAction() { session.current.load() }
+    @objc func reloadAction() { session.current.reload() }
 }
 
 // MARK: - Entry

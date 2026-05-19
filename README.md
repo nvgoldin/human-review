@@ -42,12 +42,15 @@ marked.js renderer is bundled as a resource — no network needed at runtime.
 
 | Shortcut | Action |
 |---|---|
-| `⌘]` / `⌘[` | Next / previous file |
-| `⌘W` or click ✓ Exit | Close window (fires the `exit` event) |
-| `⌘R` | Reload current file's source from disk |
-| `Tab` | In composer: submit comment |
+| `↑` / `↓` (or `k` / `j`) | Move keyboard focus between blocks |
+| `Enter` | Open composer on focused block |
+| `n` / `N` | Jump to next / previous **flagged** block (wraps) |
+| `Tab` | In composer: submit comment + auto-advance focus |
 | `⌘Enter` | In composer: submit comment (alternative) |
 | `Esc` | Cancel open composer |
+| `⌘]` / `⌘[` | Next / previous file |
+| `⌘W` or click ✓ Exit | Close window (fires the `exit` event) |
+| `⌘R` | Reload current file's source from disk + smart re-anchor |
 
 ## CLI
 
@@ -56,11 +59,18 @@ human-review <file1.md> [file2.md ...]   GUI mode (stream + emit-on-exit ON)
   --no-stream                            Disable live JSONL events
   --no-emit-on-exit                      Disable final exit-summary event
 
-human-review add <file.md> --line N --body "TEXT"   Headless add (snaps to nearest block)
-human-review list <file.md>                          Pretty-print sidecar comments as JSON
-human-review delete <file.md> --id UUID
-human-review export <file.md>                        Force-write <basename>.review.md
+human-review add     <file.md> --line N --body "TEXT" [--author NAME]
+human-review flag    <file.md> --line N --reason "TEXT" [--author NAME]
+human-review list    <file.md>                       Pretty-print sidecar comments as JSON
+human-review delete  <file.md> --id UUID             (alias: resolve)
+human-review export  <file.md>                       Force-write <basename>.review.md
+human-review reload  <file.md>                       Re-anchor comments after editing source
 ```
+
+The `flag` subcommand creates a `kind: "flag"` comment with `author: "agent"`.
+Flagged blocks render with a yellow accent in the GUI; `n` / `N` walk between
+them; clicking **Resolve** in the thread removes the flag and emits a
+`resolved` event.
 
 ## File layout per source file
 
@@ -85,24 +95,71 @@ Comment record (also the shape emitted on stdout):
 
 ## Agent integration
 
-Two equivalent paths:
+### Pull (offline)
 
-**Push** — consume stdout as the GUI runs:
-
-```bash
-human-review notes.md > /tmp/review.log &
-tail -F /tmp/review.log | jq -c 'select(.event != "session_start")'
-# react to "added" / "deleted" / "edited" events; "exit" marks end of session
-```
-
-**Pull** — ignore stdout, just read the sidecar after the user exits:
+After the user exits, just read the sidecar:
 
 ```bash
-human-review notes.md      # foreground; or background and wait $!
+human-review notes.md         # foreground; or background and wait $!
 jq '.comments' notes.md.comments.json
 ```
 
-The sidecar is always authoritative; the stream is just a notification channel.
+### Push (live, one-way)
+
+Consume stdout as the GUI runs:
+
+```bash
+human-review notes.md > /tmp/review.log &
+tail -F /tmp/review.log | jq -c '.'
+# events: session_start | added | deleted | edited | reloaded | flagged | resolved | opened | focused | exit
+```
+
+### Duplex (live, bidirectional)
+
+Pipe JSONL **commands** into stdin while reading **events** from stdout —
+the agent controls the running session without restarting human-review:
+
+```python
+import json, subprocess, threading
+proc = subprocess.Popen(
+    ["human-review", "a.md", "b.md"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    text=True, bufsize=1,
+)
+def read():
+    for line in proc.stdout:
+        ev = json.loads(line)
+        print("event:", ev["event"])
+threading.Thread(target=read, daemon=True).start()
+def send(cmd): proc.stdin.write(json.dumps(cmd) + "\n"); proc.stdin.flush()
+
+send({"cmd": "flag",    "file": "a.md", "line": 42, "reason": "verify"})
+send({"cmd": "add",     "file": "a.md", "line": 10, "body": "agent note"})
+send({"cmd": "open",    "file": "c.md"})              # append a new file live
+send({"cmd": "focus",   "file": "b.md"})              # switch GUI to a file
+send({"cmd": "reload",  "file": "a.md"})              # re-read source + re-anchor
+send({"cmd": "resolve", "file": "a.md", "id": UUID})  # remove a flag/comment
+send({"cmd": "ping"})                                  # liveness — replies "pong"
+```
+
+Stdin is read **only when it's piped** — when you launch `human-review` from
+a terminal manually, stdin stays the tty and the protocol is dormant.
+
+### Agent flag flow
+
+```
+agent edits the doc + sends `flag` commands for spots needing review
+                       ↓
+human sees 🚩 N in header, presses `n` to walk between flags,
+either resolves them or adds counter-comments
+                       ↓
+agent reads the stream — knows what was resolved, what got pushback,
+                       updates the doc, sends new flags…
+                       ↓                          (no human-review restart)
+```
+
+The sidecar JSON (`<file>.md.comments.json`) is always authoritative; the
+stream is the live notification channel.
 
 ## How block anchoring works
 
