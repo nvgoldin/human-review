@@ -815,37 +815,74 @@ enum CLI {
     static func printUsage() {
         let msg = """
         human-review · GitHub-style review for local markdown files
+                       Designed for both humans (GUI) and agents (duplex JSONL on stdio).
 
-        GUI mode (default — stream + emit-on-exit are ON):
-          human-review file1.md [file2.md ...]    Open review window(s)
-          --no-stream            Disable live JSONL events on stdout
-          --no-emit-on-exit      Disable final exit-summary event
+        ─── GUI mode (default) ─────────────────────────────────────────────────────────
+          human-review FILE.md [FILE2.md ...]      Open review window over one or more files
+          --no-stream                              Disable live JSONL events on stdout
+          --no-emit-on-exit                        Disable final exit-summary event
 
-          In the window: hover a block, click +, write a comment. Auto-saved.
-          ⌘]  next file        ⌘[  previous file
-          ⌘W  close window     ⌘R  reload current source from disk
-          Cmd+Enter submits the active composer, Esc cancels.
+        Keyboard inside the window:
+          ↑ / ↓  (or k / j)   Move focus between blocks
+          Enter               Open composer on focused block
+          n / N               Jump to next / previous flagged block (wraps)
+          Tab                 In composer: submit + auto-advance focus to next block
+          ⌘ Enter             In composer: submit (alternative)
+          Esc                 Cancel open composer
+          ⌘ ] / ⌘ [           Next / previous file
+          ⌘ R                 Reload current file's source from disk (smart re-anchor)
+          ⌘ W or click ✓ Exit Close window (fires `exit` event)
 
-        Headless subcommands (no GUI):
-          human-review add <file.md> --line N --body "TEXT" [--author NAME]
-          human-review flag <file.md> --line N --reason "TEXT" [--author NAME]
-          human-review list <file.md>
-          human-review delete <file.md> --id UUID    (alias: resolve)
-          human-review export <file.md>
-          human-review reload <file.md>   Re-anchor comments after editing source
+        ─── Headless subcommands (no GUI) ──────────────────────────────────────────────
+          human-review add    FILE.md --line N --body "TEXT"   [--author NAME]
+          human-review flag   FILE.md --line N --reason "TEXT" [--author NAME]
+          human-review list   FILE.md                          Pretty JSON of comments
+          human-review delete FILE.md --id UUID                (alias: resolve)
+          human-review export FILE.md                          Force-write FILE.review.md
+          human-review reload FILE.md                          Re-anchor after source edit
 
-        Live agent control (stdin JSONL — only when stdin is piped):
-          {"cmd":"flag","file":"…","line":N,"reason":"…"}
-          {"cmd":"add","file":"…","line":N,"body":"…"}
-          {"cmd":"resolve","file":"…","id":"UUID"}
-          {"cmd":"reload","file":"…"}
-          {"cmd":"open","file":"…"}      (append a new file to the running session)
-          {"cmd":"focus","file":"…"}     (switch GUI to that file)
-          {"cmd":"ping"}                  (round-trip liveness — replies "pong")
+          `--line N` is 1-indexed. The block at the *nearest* enclosing paragraph/
+          heading/code-block is used as the anchor — you don't have to land exactly.
 
-        Always-on side effects per file:
-          <file>.md.comments.json   sidecar store (canonical state)
-          <file>.review.md          inline-annotated markdown (regenerated on every change)
+        ─── Duplex agent protocol (stdin JSONL, auto-on when stdin is piped) ───────────
+        Commands you send (one JSON object per line):
+          {"cmd":"flag",    "file":"…", "line":N, "reason":"…"}     create 🚩 marker
+          {"cmd":"add",     "file":"…", "line":N, "body":"…"}        create regular comment
+          {"cmd":"resolve", "file":"…", "id":"UUID"}                 remove comment/flag
+          {"cmd":"reload",  "file":"…"}                              re-read source + re-anchor
+          {"cmd":"open",    "file":"…"}                              append file to running session
+          {"cmd":"focus",   "file":"…"}                              switch GUI to that file
+          {"cmd":"ping"}                                              liveness check → "pong"
+
+        Events you receive (one JSON object per line on stdout):
+          session_start  {files:[{file, comments[]}]}            on launch
+          added          {file, comment}                         user/agent added a comment
+          flagged        {file, comment}                         agent added a flag-kind comment
+          edited         {file, comment}                         comment body changed
+          deleted        {file, comment}                         regular comment removed
+          resolved       {file, comment}                         flag-kind comment removed
+          reloaded       {file, reanchor:{unchanged,relocated,orphaned}}
+          opened         {file}                                  file appended to session
+          focused        {file}                                  GUI switched to file
+          pong           {}                                       reply to ping
+          command_error  {raw, reason}                           bad cmd or unknown file
+          exit           {files:[{file, comments[]}]}            window closed — final state
+
+        Comment record shape (same in events, sidecar, and `list` output):
+          {id:"UUID", anchorLine:N0 (0-indexed), anchorText:"first 80 chars of block",
+           body:"…", author:"…", createdAt:"ISO8601", kind:"comment"|"flag", orphaned:false}
+
+        ─── Always-on side effects per file ────────────────────────────────────────────
+          FILE.md.comments.json   canonical sidecar (kept atomically up-to-date)
+          FILE.review.md          inline-annotated copy with [!review] callouts after each block
+
+        ─── Example: bidirectional agent flow ──────────────────────────────────────────
+          proc = Popen(["human-review", "a.md", "b.md"],
+                       stdin=PIPE, stdout=PIPE, text=True, bufsize=1)
+          # send commands:
+          proc.stdin.write(json.dumps({"cmd":"flag","file":"a.md","line":42,
+                                       "reason":"verify"}) + "\\n"); proc.stdin.flush()
+          # read events line-by-line from proc.stdout, react to "resolved" / "added".
 
         """
         FileHandle.standardError.write(msg.data(using: .utf8)!)
