@@ -182,8 +182,31 @@
   }
   .comment-body {
     font-size: 13.5px;
-    white-space: pre-wrap;
     word-wrap: break-word;
+  }
+  /* Rendered markdown inside a comment — tight margins so it reads as a chat bubble */
+  .comment-body > :first-child { margin-top: 0; }
+  .comment-body > :last-child  { margin-bottom: 0; }
+  .comment-body p { margin: 0.3em 0; }
+  .comment-body ul, .comment-body ol { padding-left: 1.4em; margin: 0.3em 0; }
+  .comment-body li { margin: 0.1em 0; }
+  .comment-body code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.92em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  .comment-body pre { background: var(--code-bg); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 0.4em 0; }
+  .comment-body pre code { background: transparent; padding: 0; font-size: 0.85em; }
+  .comment-body blockquote { margin: 0.3em 0; padding: 2px 10px; border-left: 3px solid var(--border); color: var(--muted); }
+  .comment-body h1, .comment-body h2, .comment-body h3 { font-size: 1.05em; margin: 0.4em 0 0.2em; border: none; padding: 0; }
+
+  /* Read receipts (WhatsApp-style ✓✓) */
+  .read-receipt {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    color: #0a84ff;
+    margin-left: 4px;
+  }
+  .read-receipt-names {
+    color: var(--muted);
+    font-size: 11px;
+    margin-left: 2px;
   }
 
   /* Composer */
@@ -256,6 +279,14 @@
   hr { border: none; border-top: 1px solid var(--border); margin: 1.4em 0; }
 </style>
 <script src="marked.min.js"></script>
+<script>
+  // Configure marked once. `breaks: true` makes single newlines render as <br>,
+  // which is what chat-style comment bodies expect. `gfm: true` enables tables,
+  // task lists, fenced code blocks, autolinks.
+  if (window.marked && window.marked.setOptions) {
+    marked.setOptions({ breaks: true, gfm: true });
+  }
+</script>
 </head>
 <body>
 <div id="content"></div>
@@ -364,16 +395,22 @@ function renderComment(c, idx) {
   const time = dt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
   const isAgent = (c.author || '').toLowerCase() === 'agent';
   const isReply = !!c.replyTo;
+  const readers = Array.isArray(c.readBy) ? c.readBy : [];
+  const readReceipt = readers.length
+    ? `<span class="read-receipt" title="read by ${readers.map(escapeHtml).join(', ')}">✓✓</span><span class="read-receipt-names">${escapeHtml(readers.join(', '))}</span>`
+    : '';
+  const bodyHtml = (window.marked && marked.parse) ? marked.parse(c.body || '') : escapeHtml(c.body || '');
   return `
     <div class="comment ${isAgent ? 'is-agent' : ''}" data-id="${escapeHtml(c.id)}">
       <div class="comment-head">
         <span class="author">${escapeHtml(c.author)}</span>
         ${isReply ? '<span class="reply-marker">↪ reply</span>' : ''}
         <span>${date} ${time}</span>
+        ${readReceipt}
         <span class="spacer"></span>
         <button data-action="delete-comment" data-id="${escapeHtml(c.id)}">Delete</button>
       </div>
-      <div class="comment-body">${escapeHtml(c.body)}</div>
+      <div class="comment-body">${bodyHtml}</div>
     </div>
   `;
 }

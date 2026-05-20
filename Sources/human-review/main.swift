@@ -23,6 +23,34 @@ struct Comment: Codable, Identifiable, Hashable {
     var createdAt: Date = Date()
     var resolved: Bool = false
     var orphaned: Bool = false
+    /// Authors who have explicitly read/ack'd this comment. The comment's own
+    /// `author` is implicit and never included here (you don't ack yourself).
+    var readBy: [String] = []
+
+    enum CodingKeys: String, CodingKey {
+        case id, replyTo, anchorLine, anchorText, body, author, createdAt, resolved, orphaned, readBy
+    }
+    init(id: UUID = UUID(), replyTo: UUID? = nil, anchorLine: Int, anchorText: String,
+         body: String, author: String, createdAt: Date = Date(),
+         resolved: Bool = false, orphaned: Bool = false, readBy: [String] = []) {
+        self.id = id; self.replyTo = replyTo
+        self.anchorLine = anchorLine; self.anchorText = anchorText
+        self.body = body; self.author = author; self.createdAt = createdAt
+        self.resolved = resolved; self.orphaned = orphaned; self.readBy = readBy
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.replyTo = try c.decodeIfPresent(UUID.self, forKey: .replyTo)
+        self.anchorLine = try c.decode(Int.self, forKey: .anchorLine)
+        self.anchorText = try c.decode(String.self, forKey: .anchorText)
+        self.body = try c.decode(String.self, forKey: .body)
+        self.author = try c.decode(String.self, forKey: .author)
+        self.createdAt = try c.decode(Date.self, forKey: .createdAt)
+        self.resolved = try c.decodeIfPresent(Bool.self, forKey: .resolved) ?? false
+        self.orphaned = try c.decodeIfPresent(Bool.self, forKey: .orphaned) ?? false
+        self.readBy = try c.decodeIfPresent([String].self, forKey: .readBy) ?? []
+    }
 }
 
 struct CommentFile: Codable {
@@ -399,6 +427,19 @@ final class ReviewStore: ObservableObject {
         emit(event: "edited", comment: comments[idx])
     }
 
+    /// Mark a comment as read by `reader`. No-op if reader is the comment's own
+    /// author, or already in readBy. Emits a `read` event on success.
+    @discardableResult
+    func ackComment(_ id: UUID, by reader: String) -> Bool {
+        guard let idx = comments.firstIndex(where: { $0.id == id }) else { return false }
+        guard comments[idx].author != reader else { return false }
+        guard !comments[idx].readBy.contains(reader) else { return false }
+        comments[idx].readBy.append(reader)
+        persist()
+        emit(event: "read", comment: comments[idx])
+        return true
+    }
+
     /// Delete a single comment. If it's a thread root, the whole thread
     /// (and any replies) is removed.
     func deleteComment(_ id: UUID) {
@@ -697,6 +738,12 @@ final class CommandRouter {
                 guard let idStr = obj["id"] as? String,
                       let id = UUID(uuidString: idStr) else { throw CmdErr.missing("id") }
                 store.deleteComment(id)
+            case "ack":
+                let store = try resolveStore(session, obj)
+                guard let idStr = obj["id"] as? String,
+                      let id = UUID(uuidString: idStr) else { throw CmdErr.missing("id") }
+                let by = (obj["author"] as? String) ?? "agent"
+                store.ackComment(id, by: by)
             case "reload":
                 try resolveStore(session, obj).reload()
             case "open":
@@ -920,7 +967,7 @@ enum CLI {
 
         let subcommands: Set<String> = [
             "add", "list", "export", "delete", "resolve", "reopen", "reload",
-            "watch", "wait", "threads", "get", "prune",
+            "watch", "wait", "threads", "get", "prune", "ack",
             "help", "-h", "--help"
         ]
         if subcommands.contains(args[0]) {
@@ -938,6 +985,7 @@ enum CLI {
             case "threads": return cmdThreads(Array(args.dropFirst()))
             case "get":     return cmdGet(Array(args.dropFirst()))
             case "prune":   return cmdPrune(Array(args.dropFirst()))
+            case "ack":     return cmdAck(Array(args.dropFirst()))
             default: break
             }
         }
@@ -1025,11 +1073,14 @@ enum CLI {
           human-review reload  FILE.md
           human-review export  FILE.md
 
-        Read.
+        Read. `get` and `wait` auto-ack the matched comment (read-receipt under
+        --author, default "agent") unless you pass --no-ack. `list` and `watch`
+        do NOT auto-ack — pass --ack if you want them to.
 
-          human-review list    FILE.md                  All comments as a JSON array
+          human-review list    FILE.md                       All comments as a JSON array
           human-review threads FILE.md [--active|--settled]   Thread roots + reply counts
-          human-review get     FILE.md --id UUID        One comment as JSON
+          human-review get     FILE.md --id UUID [--no-ack] [--author NAME]
+          human-review ack     FILE.md --id UUID [--author NAME]   Explicit read receipt
 
         Subscribe to live events (tails FILE.md.events.jsonl, blocks):
 
@@ -1039,15 +1090,17 @@ enum CLI {
 
         Block-and-wait helpers (exit 0 on match, 124 on timeout):
 
-          human-review wait    FILE.md --reply-to UUID  [--from-author NAME] [--timeout S]
-              Blocks until any reply lands in the thread containing UUID.
-              Prints the matching event JSON on stdout.
+          human-review wait    FILE.md --reply-to UUID  [--from-author NAME]
+                                                       [--no-ack] [--author NAME] [--timeout S]
+              Blocks until any reply lands in the thread containing UUID. Prints
+              the matching event JSON. By default the matched reply is ack'd
+              under --author (default "agent") — pass --no-ack to skip.
 
-          human-review wait    FILE.md --resolve UUID                  [--timeout S]
-              Blocks until that thread is marked resolved.
+          human-review wait    FILE.md --resolve UUID  [--no-ack] [--author NAME] [--timeout S]
+              Blocks until that thread is marked resolved. Auto-acks the root.
 
           human-review wait    FILE.md --exit                          [--timeout S]
-              Blocks until a GUI session closes for that file.
+              Blocks until a GUI session closes for that file. No auto-ack.
 
         Housekeeping:
 
@@ -1078,6 +1131,7 @@ enum CLI {
         Stdin commands (auto-active when stdin is piped):
           {"cmd":"add","file":"…","line":N,"body":"…"} | {"cmd":"add","replyTo":"UUID",…}
           {"cmd":"resolve","file":"…","id":"UUID"} | {"cmd":"reopen",…} | {"cmd":"delete",…}
+          {"cmd":"ack","file":"…","id":"UUID","author":"agent"}
           {"cmd":"reload",…} | {"cmd":"open",…} | {"cmd":"focus",…} | {"cmd":"ping"}
 
         ─── Event shapes ───────────────────────────────────────────────────────────────
@@ -1089,12 +1143,17 @@ enum CLI {
           deleted       {file, comment}            comment removed (root → whole thread)
           resolved      {file, comment}            thread root settled
           reopened      {file, comment}            thread root un-settled (manual or auto)
+          read          {file, comment}            comment was read (readBy updated)
           reloaded      {file, reanchor:{unchanged,relocated,orphaned}}
 
         Comment record:
           {id:"UUID", replyTo:"UUID"|null, anchorLine:N0 (0-indexed),
-           anchorText:"first 80 chars of block", body:"…", author:"…",
-           createdAt:"ISO8601", resolved:bool, orphaned:bool}
+           anchorText:"first 80 chars of block", body:"… (markdown — rendered in GUI)",
+           author:"…", createdAt:"ISO8601", resolved:bool, orphaned:bool,
+           readBy:["agent", …]   ← authors who have ack'd this comment}
+
+        Comment bodies are rendered as Markdown in the GUI (GFM + soft-break newlines),
+        so use **bold**, `inline code`, lists, and code fences freely.
 
         """
         FileHandle.standardError.write(msg.data(using: .utf8)!)
@@ -1293,7 +1352,7 @@ enum CLI {
     /// On --timeout T (seconds): exits 124 with no output.
     static func cmdWait(_ args: [String]) -> Int32 {
         guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
-            FileHandle.standardError.write("usage: human-review wait FILE.md (--reply-to UUID | --resolve UUID | --exit) [--timeout S] [--from-start]\n".data(using: .utf8)!)
+            FileHandle.standardError.write("usage: human-review wait FILE.md (--reply-to UUID | --resolve UUID | --exit) [--timeout S] [--from-start] [--from-author NAME] [--no-ack] [--author NAME]\n".data(using: .utf8)!)
             return 2
         }
         let replyTo  = flagValue(args, "--reply-to")
@@ -1302,6 +1361,8 @@ enum CLI {
         let fromAuthor = flagValue(args, "--from-author")
         let timeout = flagValue(args, "--timeout").flatMap { Double($0) }
         let fromStart = args.contains("--from-start")
+        let noAck = args.contains("--no-ack")
+        let ackAuthor = flagValue(args, "--author") ?? "agent"
 
         let modes = [replyTo != nil, resolve != nil, waitExit].filter { $0 }.count
         if modes != 1 {
@@ -1316,37 +1377,58 @@ enum CLI {
 
         // Build predicate. For --reply-to, we discover thread membership as we go.
         var threadIds: Set<String> = Set(replyTo.map { [$0] } ?? [])
+        let matchedHolder = MatchedLineHolder()
 
         let predicate: (String) -> Bool = { line in
             guard let data = line.data(using: .utf8),
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let ev = obj["event"] as? String else { return false }
 
+            var matched = false
             if let target = resolve {
-                return ev == "resolved" && (obj["comment"] as? [String: Any])?["id"] as? String == target
+                matched = ev == "resolved" && (obj["comment"] as? [String: Any])?["id"] as? String == target
+            } else if waitExit {
+                matched = ev == "gui_closed"
+            } else {
+                // reply-to mode
+                guard ev == "added", let c = obj["comment"] as? [String: Any] else { return false }
+                let parent = c["replyTo"] as? String
+                let id = c["id"] as? String
+                if let p = parent, threadIds.contains(p), let i = id { threadIds.insert(i) }
+                if let p = parent, threadIds.contains(p) {
+                    if let want = fromAuthor, (c["author"] as? String) != want {} else { matched = true }
+                }
             }
-            if waitExit {
-                return ev == "gui_closed"
-            }
-            // reply-to mode
-            guard ev == "added", let c = obj["comment"] as? [String: Any] else { return false }
-            let parent = c["replyTo"] as? String
-            let id = c["id"] as? String
-            // Track thread membership: any descendant whose replyTo ∈ threadIds joins.
-            if let p = parent, threadIds.contains(p), let i = id { threadIds.insert(i) }
-            // Match: any reply whose parent ∈ threadIds, optionally filtered by author.
-            if let p = parent, threadIds.contains(p) {
-                if let want = fromAuthor, (c["author"] as? String) != want { return false }
-                return true
-            }
-            return false
+            if matched { matchedHolder.set(line) }
+            return matched
         }
 
-        return tailAndFilter(
+        let rc = tailAndFilter(
             logPaths: [logPath], fromStart: fromStart, typesFilter: nil,
             stopOn: predicate, timeout: timeout,
-            printOnly: { line in true }
+            printOnly: { _ in true }
         )
+
+        // Auto-ack the matched comment unless suppressed. --exit has no specific
+        // comment, so we skip ack there.
+        if rc == 0, !noAck, !waitExit, let matched = matchedHolder.get(),
+           let data = matched.data(using: .utf8),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let c = obj["comment"] as? [String: Any],
+           let idStr = c["id"] as? String, let id = UUID(uuidString: idStr) {
+            MainActor.assumeIsolated {
+                let store = ReviewStore(fileURL: url, streamToStdout: false)
+                store.ackComment(id, by: ackAuthor)
+            }
+        }
+        return rc
+    }
+
+    final class MatchedLineHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var line: String?
+        func set(_ s: String) { lock.lock(); line = s; lock.unlock() }
+        func get() -> String? { lock.lock(); defer { lock.unlock() }; return line }
     }
 
     /// List thread roots for a file. Defaults: all roots. --active / --settled filter.
@@ -1402,25 +1484,52 @@ enum CLI {
         }
     }
 
+    /// Fetch a single comment. Pulling implies reading: by default this also
+    /// acks the comment under --author (default "agent"). Pass --no-ack to fetch
+    /// silently. The printed JSON reflects the post-ack state (readBy updated).
     static func cmdGet(_ args: [String]) -> Int32 {
         guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
-            FileHandle.standardError.write("usage: human-review get FILE.md --id UUID\n".data(using: .utf8)!)
+            FileHandle.standardError.write("usage: human-review get FILE.md --id UUID [--no-ack] [--author NAME]\n".data(using: .utf8)!)
             return 2
         }
         guard let idStr = flagValue(args, "--id"), let id = UUID(uuidString: idStr) else {
             FileHandle.standardError.write("--id UUID required\n".data(using: .utf8)!); return 2
         }
         let url = resolveURL(file)
+        let ack = !args.contains("--no-ack")
+        let author = flagValue(args, "--author") ?? "agent"
         return MainActor.assumeIsolated {
             let store = ReviewStore(fileURL: url, streamToStdout: false)
-            guard let c = store.comments.first(where: { $0.id == id }) else {
+            guard store.comments.contains(where: { $0.id == id }) else {
                 FileHandle.standardError.write("not found: \(idStr)\n".data(using: .utf8)!); return 1
             }
-            let enc = JSONEncoder()
-            enc.dateEncodingStrategy = .iso8601
-            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            if let data = try? enc.encode(c), let s = String(data: data, encoding: .utf8) {
-                print(s)
+            if ack { store.ackComment(id, by: author) }
+            guard let c = store.comments.first(where: { $0.id == id }) else { return 1 }
+            printJSON(c)
+            return 0
+        }
+    }
+
+    /// Explicitly mark a comment as read by --author (default "agent"). No-op
+    /// if the reader is the comment's author or already in readBy.
+    static func cmdAck(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("usage: human-review ack FILE.md --id UUID [--author NAME]\n".data(using: .utf8)!)
+            return 2
+        }
+        guard let idStr = flagValue(args, "--id"), let id = UUID(uuidString: idStr) else {
+            FileHandle.standardError.write("--id UUID required\n".data(using: .utf8)!); return 2
+        }
+        let url = resolveURL(file)
+        let author = flagValue(args, "--author") ?? "agent"
+        return MainActor.assumeIsolated {
+            let store = ReviewStore(fileURL: url, streamToStdout: false)
+            guard store.comments.contains(where: { $0.id == id }) else {
+                FileHandle.standardError.write("not found: \(idStr)\n".data(using: .utf8)!); return 1
+            }
+            store.ackComment(id, by: author)
+            if let c = store.comments.first(where: { $0.id == id }) {
+                printJSON(c)
             }
             return 0
         }
