@@ -3,6 +3,7 @@ import SwiftUI
 import WebKit
 import CryptoKit
 import Darwin
+import Combine
 
 // Line-buffer stdout so JSONL stream events appear immediately even when piped.
 setlinebuf(stdout)
@@ -13,6 +14,14 @@ setlinebuf(stdout)
 /// comment with `replyTo == nil`. Only the root carries authoritative
 /// `anchorLine` / `anchorText` / `resolved` / `orphaned` values; replies
 /// inherit at render time.
+/// A comment's anchor scope.
+/// - block: anchored to a specific markdown block at `anchorLine`. (default)
+/// - global: file-level (no block anchor). Renders in the right-side chat sidebar.
+enum CommentScope: String, Codable {
+    case block
+    case global
+}
+
 struct Comment: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
     var replyTo: UUID? = nil
@@ -26,17 +35,22 @@ struct Comment: Codable, Identifiable, Hashable {
     /// Authors who have explicitly read/ack'd this comment. The comment's own
     /// `author` is implicit and never included here (you don't ack yourself).
     var readBy: [String] = []
+    /// Where this comment lives: block-anchored or document-wide. Replies
+    /// inherit the scope of their thread root.
+    var scope: CommentScope = .block
 
     enum CodingKeys: String, CodingKey {
-        case id, replyTo, anchorLine, anchorText, body, author, createdAt, resolved, orphaned, readBy
+        case id, replyTo, anchorLine, anchorText, body, author, createdAt, resolved, orphaned, readBy, scope
     }
     init(id: UUID = UUID(), replyTo: UUID? = nil, anchorLine: Int, anchorText: String,
          body: String, author: String, createdAt: Date = Date(),
-         resolved: Bool = false, orphaned: Bool = false, readBy: [String] = []) {
+         resolved: Bool = false, orphaned: Bool = false, readBy: [String] = [],
+         scope: CommentScope = .block) {
         self.id = id; self.replyTo = replyTo
         self.anchorLine = anchorLine; self.anchorText = anchorText
         self.body = body; self.author = author; self.createdAt = createdAt
         self.resolved = resolved; self.orphaned = orphaned; self.readBy = readBy
+        self.scope = scope
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -50,6 +64,7 @@ struct Comment: Codable, Identifiable, Hashable {
         self.resolved = try c.decodeIfPresent(Bool.self, forKey: .resolved) ?? false
         self.orphaned = try c.decodeIfPresent(Bool.self, forKey: .orphaned) ?? false
         self.readBy = try c.decodeIfPresent([String].self, forKey: .readBy) ?? []
+        self.scope = try c.decodeIfPresent(CommentScope.self, forKey: .scope) ?? .block
     }
 }
 
@@ -382,7 +397,8 @@ final class ReviewStore: ObservableObject {
     /// reopens it. Returns the new comment.
     @discardableResult
     func addComment(line: Int, anchorText: String, body: String,
-                    replyTo: UUID? = nil, author: String? = nil) -> Comment? {
+                    replyTo: UUID? = nil, author: String? = nil,
+                    scope: CommentScope = .block) -> Comment? {
         let who = author ?? self.author
         var c: Comment
         if let parentId = replyTo {
@@ -391,10 +407,11 @@ final class ReviewStore: ObservableObject {
                 statusMessage = "Reply target not found: \(parentId)"
                 return nil
             }
+            // Replies inherit the root's scope and anchor metadata.
             c = Comment(replyTo: parentId, anchorLine: root.anchorLine,
                         anchorText: root.anchorText, body: body,
-                        author: who, resolved: false, orphaned: root.orphaned)
-            // Auto-reopen on reply.
+                        author: who, resolved: false, orphaned: root.orphaned,
+                        scope: root.scope)
             var reopened = false
             if root.resolved {
                 if let i = comments.firstIndex(where: { $0.id == root.id }) {
@@ -410,9 +427,14 @@ final class ReviewStore: ObservableObject {
             }
             return c
         } else {
-            let snippet = String(anchorText.prefix(80))
-            c = Comment(replyTo: nil, anchorLine: line, anchorText: snippet,
-                        body: body, author: who)
+            // Global comments don't anchor to a specific block — clear the
+            // anchor metadata so downstream renderers/exports don't accidentally
+            // try to place them inline.
+            let resolvedAnchorLine = (scope == .global) ? 0 : line
+            let resolvedAnchorText = (scope == .global) ? "" : String(anchorText.prefix(80))
+            c = Comment(replyTo: nil, anchorLine: resolvedAnchorLine,
+                        anchorText: resolvedAnchorText, body: body,
+                        author: who, scope: scope)
             comments.append(c)
             persist()
             emit(event: "added", comment: c)
@@ -573,15 +595,31 @@ final class ReviewSession: ObservableObject {
     let emitOnExit: Bool
     var suppressExitEvent: Bool = false
     private var stores: [URL: ReviewStore] = [:]
+    private var storeSubs: Set<AnyCancellable> = []
+    /// The human's display name — comments authored by anyone else, scoped
+    /// global, count as "unread" for them until they navigate to the file.
+    let humanName: String
 
     init(urls: [URL], stream: Bool, emitOnExit: Bool) {
         self.urls = urls
         self.stream = stream
         self.emitOnExit = emitOnExit
+        let full = NSFullUserName()
+        self.humanName = full.isEmpty ? NSUserName() : full
         for url in urls {
-            stores[url] = ReviewStore(fileURL: url, streamToStdout: stream)
+            let store = ReviewStore(fileURL: url, streamToStdout: stream)
+            stores[url] = store
+            // Re-emit our own changed signal when any store's state changes,
+            // so SwiftUI views observing the session (e.g. HeaderBar's badges)
+            // refresh when an out-of-focus file gains a new global comment.
+            store.objectWillChange
+                .sink { [weak self] _ in self?.objectWillChange.send() }
+                .store(in: &storeSubs)
         }
         if stream { emitSessionStart() }
+        // Auto-ack globals for the initially-visible file so it doesn't show
+        // a stale unread count to the user who is literally about to see them.
+        autoAckCurrentGlobals()
     }
 
     func store(at index: Int) -> ReviewStore { stores[urls[index]]! }
@@ -591,19 +629,32 @@ final class ReviewSession: ObservableObject {
     var canGoNext: Bool { currentIndex < urls.count - 1 }
     var canGoPrev: Bool { currentIndex > 0 }
 
-    func next() { if canGoNext { currentIndex += 1 } }
-    func previous() { if canGoPrev { currentIndex -= 1 } }
+    func next() {
+        if canGoNext {
+            currentIndex += 1
+            autoAckCurrentGlobals()
+        }
+    }
+    func previous() {
+        if canGoPrev {
+            currentIndex -= 1
+            autoAckCurrentGlobals()
+        }
+    }
 
     @discardableResult
     func openFile(_ url: URL) -> Int {
         if let i = urls.firstIndex(of: url) { return i }
         urls.append(url)
-        stores[url] = ReviewStore(fileURL: url, streamToStdout: stream)
-        // Per-file gui_opened so a brand-new file's watcher fires.
+        let store = ReviewStore(fileURL: url, streamToStdout: stream)
+        stores[url] = store
+        store.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &storeSubs)
         let perFile = StreamEvent(
             event: "gui_opened", timestamp: Date(), file: url.path,
             comment: nil,
-            files: [FileSummary(file: url.path, comments: stores[url]?.comments ?? [])],
+            files: [FileSummary(file: url.path, comments: store.comments)],
             reanchor: nil
         )
         EventLog.append(perFile, for: url)
@@ -613,7 +664,36 @@ final class ReviewSession: ObservableObject {
     func focusFile(_ url: URL) -> Bool {
         guard let i = urls.firstIndex(of: url) else { return false }
         currentIndex = i
+        autoAckCurrentGlobals()
         return true
+    }
+
+    /// Count of unread (by `humanName`) global comments in the file at
+    /// `index`. Used by HeaderBar to draw the chevron badge.
+    func unreadGlobalsCount(at index: Int) -> Int {
+        guard index >= 0, index < urls.count else { return 0 }
+        guard let store = stores[urls[index]] else { return 0 }
+        var n = 0
+        for c in store.comments
+        where c.scope == .global
+           && c.author != humanName
+           && !c.readBy.contains(humanName) {
+            n += 1
+        }
+        return n
+    }
+
+    /// Auto-ack every global comment in the currently-focused file under the
+    /// human's name. Called on launch and on every navigation.
+    private func autoAckCurrentGlobals() {
+        guard currentIndex >= 0, currentIndex < urls.count else { return }
+        guard let store = stores[urls[currentIndex]] else { return }
+        for c in store.comments
+        where c.scope == .global
+           && c.author != humanName
+           && !c.readBy.contains(humanName) {
+            store.ackComment(c.id, by: humanName)
+        }
     }
 
     private func emitSessionStart() {
@@ -714,14 +794,19 @@ final class CommandRouter {
                 guard !body.isEmpty else { throw CmdErr.missing("body") }
                 let author = (obj["author"] as? String) ?? "agent"
                 let replyTo = (obj["replyTo"] as? String).flatMap { UUID(uuidString: $0) }
+                let isGlobal = (obj["global"] as? Bool) ?? false
                 if replyTo != nil {
+                    // Replies inherit scope from root.
                     store.addComment(line: 0, anchorText: "", body: body,
                                      replyTo: replyTo, author: author)
+                } else if isGlobal {
+                    store.addComment(line: 0, anchorText: "", body: body,
+                                     replyTo: nil, author: author, scope: .global)
                 } else {
                     guard let line = obj["line"] as? Int else { throw CmdErr.missing("line") }
                     let (start, text) = CLI.nearestBlock(in: store.source, around: max(0, line - 1))
                     store.addComment(line: start, anchorText: text, body: body,
-                                     replyTo: nil, author: author)
+                                     replyTo: nil, author: author, scope: .block)
                 }
             case "resolve":
                 let store = try resolveStore(session, obj)
@@ -791,6 +876,7 @@ final class CommandRouter {
 
 final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     weak var store: ReviewStore?
+    weak var session: ReviewSession?
     var onReady: (() -> Void)?
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -823,6 +909,60 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
             if let idStr = dict["id"] as? String, let id = UUID(uuidString: idStr) {
                 Task { @MainActor in self.store?.reopenThread(id) }
             }
+        case "nextFile":
+            Task { @MainActor in self.session?.next() }
+        case "prevFile":
+            Task { @MainActor in self.session?.previous() }
+        case "addGlobal":
+            guard let body = dict["body"] as? String, !body.isEmpty else { return }
+            Task { @MainActor in
+                self.store?.addComment(line: 0, anchorText: "", body: body,
+                                       replyTo: nil, author: nil, scope: .global)
+            }
+        case "fetchSection":
+            // Cross-link overlay: read a referenced markdown file from disk and
+            // pass its full source back to JS, which extracts the relevant
+            // section by fragment and renders it in a modal.
+            guard let path = dict["path"] as? String else { return }
+            let fragment = (dict["fragment"] as? String) ?? ""
+            let webView = message.webView
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let source = try String(contentsOf: url, encoding: .utf8)
+                    let payload: [String: Any] = [
+                        "path": url.path,
+                        "fragment": fragment,
+                        "source": source
+                    ]
+                    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+                          let json = String(data: data, encoding: .utf8) else { return }
+                    DispatchQueue.main.async {
+                        webView?.evaluateJavaScript("if (window.hr && window.hr.showOverlay) { window.hr.showOverlay(\(json)); }")
+                    }
+                } catch {
+                    let payload: [String: Any] = [
+                        "path": url.path,
+                        "fragment": fragment,
+                        "reason": error.localizedDescription
+                    ]
+                    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+                          let json = String(data: data, encoding: .utf8) else { return }
+                    DispatchQueue.main.async {
+                        webView?.evaluateJavaScript("if (window.hr && window.hr.showOverlayError) { window.hr.showOverlayError(\(json)); }")
+                    }
+                }
+            }
+        case "openInSession":
+            guard let path = dict["path"] as? String else { return }
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+            Task { @MainActor in
+                guard let session = self.session else { return }
+                if FileManager.default.fileExists(atPath: url.path) {
+                    session.openFile(url)
+                    _ = session.focusFile(url)
+                }
+            }
         default:
             break
         }
@@ -831,10 +971,12 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
 
 struct MarkdownWebView: NSViewRepresentable {
     @ObservedObject var store: ReviewStore
+    var session: ReviewSession?
 
     func makeCoordinator() -> WebViewCoordinator {
         let c = WebViewCoordinator()
         c.store = store
+        c.session = session
         return c
     }
 
@@ -862,6 +1004,7 @@ struct MarkdownWebView: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.store = store
+        context.coordinator.session = session
         Self.pushState(webView: webView, store: store)
     }
 
@@ -880,10 +1023,11 @@ struct MarkdownWebView: NSViewRepresentable {
 
 struct FileReviewView: View {
     @ObservedObject var store: ReviewStore
+    var session: ReviewSession?
 
     var body: some View {
         VStack(spacing: 0) {
-            MarkdownWebView(store: store)
+            MarkdownWebView(store: store, session: session)
             Divider()
             HStack {
                 Text(store.statusMessage)
@@ -897,10 +1041,28 @@ struct FileReviewView: View {
     }
 }
 
+/// Small red rounded badge with a number (caps at "9+"). For chevron unreads.
+struct UnreadBadge: View {
+    let count: Int
+    var body: some View {
+        if count > 0 {
+            Text(count > 9 ? "9+" : "\(count)")
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .foregroundColor(.white)
+                .frame(minWidth: 16, minHeight: 16)
+                .padding(.horizontal, count > 9 ? 3 : 0)
+                .background(Capsule().fill(Color.red))
+                .offset(x: 8, y: -6)
+        }
+    }
+}
+
 struct HeaderBar: View {
     @ObservedObject var session: ReviewSession
 
     private var activeCount: Int { session.current.activeThreadRoots.count }
+    private var prevUnread: Int { session.unreadGlobalsCount(at: session.currentIndex - 1) }
+    private var nextUnread: Int { session.unreadGlobalsCount(at: session.currentIndex + 1) }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -922,12 +1084,22 @@ struct HeaderBar: View {
                     .help("\(activeCount) active thread\(activeCount == 1 ? "" : "s") — press n / N to navigate")
             }
             Spacer()
-            Button(action: { session.previous() }) { Image(systemName: "chevron.left") }
-                .disabled(!session.canGoPrev)
-                .help("Previous file (⌘[)")
+            Button(action: { session.previous() }) {
+                Image(systemName: "chevron.left")
+                    .overlay(alignment: .topTrailing) { UnreadBadge(count: prevUnread) }
+            }
+            .disabled(!session.canGoPrev)
+            .help(prevUnread > 0
+                  ? "Previous file (⌘[) — \(prevUnread) unread"
+                  : "Previous file (⌘[)")
             if session.canGoNext {
-                Button(action: { session.next() }) { Image(systemName: "chevron.right") }
-                    .help("Next file (⌘])")
+                Button(action: { session.next() }) {
+                    Image(systemName: "chevron.right")
+                        .overlay(alignment: .topTrailing) { UnreadBadge(count: nextUnread) }
+                }
+                .help(nextUnread > 0
+                      ? "Next file (⌘]) — \(nextUnread) unread"
+                      : "Next file (⌘])")
             } else {
                 Button(action: { NSApp.terminate(nil) }) {
                     HStack(spacing: 4) {
@@ -952,7 +1124,7 @@ struct SessionWindow: View {
         VStack(spacing: 0) {
             HeaderBar(session: session)
             Divider()
-            FileReviewView(store: session.current)
+            FileReviewView(store: session.current, session: session)
                 .id(session.currentIndex)
         }
     }
@@ -1067,6 +1239,14 @@ enum CLI {
 
           human-review add     FILE.md --line N    --body "TEXT" [--author NAME]
           human-review add     FILE.md --reply-to UUID --body "TEXT" [--author NAME]
+          human-review add     FILE.md --global    --body "TEXT" [--author NAME]
+                                                      ^^^^^^^^
+              ENTIRE-DOCUMENT thread — not anchored to any block. Renders in the
+              right-side "Document chat" sidebar of the GUI. Use this when the
+              comment applies to the whole file (overall direction, tone, plan,
+              meta-questions) instead of one paragraph. Replies inherit scope
+              from their root, so `--reply-to UUID` works the same way.
+
           human-review resolve FILE.md --id UUID
           human-review reopen  FILE.md --id UUID
           human-review delete  FILE.md --id UUID
@@ -1077,8 +1257,9 @@ enum CLI {
         --author, default "agent") unless you pass --no-ack. `list` and `watch`
         do NOT auto-ack — pass --ack if you want them to.
 
-          human-review list    FILE.md                       All comments as a JSON array
-          human-review threads FILE.md [--active|--settled]   Thread roots + reply counts
+          human-review list    FILE.md [--scope block|global|all]   All comments as JSON
+          human-review threads FILE.md [--active|--settled]
+                                       [--scope block|global|all]   Thread roots + reply counts
           human-review get     FILE.md --id UUID [--no-ack] [--author NAME]
           human-review ack     FILE.md --id UUID [--author NAME]   Explicit read receipt
 
@@ -1129,7 +1310,9 @@ enum CLI {
         usage in the watch subcommand for the equivalent shell-native flow.
 
         Stdin commands (auto-active when stdin is piped):
-          {"cmd":"add","file":"…","line":N,"body":"…"} | {"cmd":"add","replyTo":"UUID",…}
+          {"cmd":"add","file":"…","line":N,"body":"…"}
+          {"cmd":"add","file":"…","global":true,"body":"…"}        ← whole-doc thread
+          {"cmd":"add","file":"…","replyTo":"UUID","body":"…"}
           {"cmd":"resolve","file":"…","id":"UUID"} | {"cmd":"reopen",…} | {"cmd":"delete",…}
           {"cmd":"ack","file":"…","id":"UUID","author":"agent"}
           {"cmd":"reload",…} | {"cmd":"open",…} | {"cmd":"focus",…} | {"cmd":"ping"}
@@ -1147,13 +1330,37 @@ enum CLI {
           reloaded      {file, reanchor:{unchanged,relocated,orphaned}}
 
         Comment record:
-          {id:"UUID", replyTo:"UUID"|null, anchorLine:N0 (0-indexed),
-           anchorText:"first 80 chars of block", body:"… (markdown — rendered in GUI)",
+          {id:"UUID", replyTo:"UUID"|null,
+           scope:"block"|"global",         ← anchored vs whole-doc
+           anchorLine:N0 (0-indexed; meaningful only when scope=="block"),
+           anchorText:"first 80 chars of block",
+           body:"… (markdown — rendered in GUI)",
            author:"…", createdAt:"ISO8601", resolved:bool, orphaned:bool,
-           readBy:["agent", …]   ← authors who have ack'd this comment}
+           readBy:["agent", …]}
 
         Comment bodies are rendered as Markdown in the GUI (GFM + soft-break newlines),
         so use **bold**, `inline code`, lists, and code fences freely.
+
+        Cross-linking. Standard markdown links to OTHER local files open as an
+        overlay (preview), not a navigation. Use absolute paths and optional
+        anchor fragments:
+
+            satisfies [FSR § 6.4](/Users/me/docs/fsr.md#section-6-4-pull-functions)
+
+        Clicking that link in the GUI opens a modal showing just the section
+        whose heading matches the fragment (auto-slug or substring match).
+        The overlay has an "Open in review" button that adds the linked file
+        to the running session so you can comment on it too. http/https links
+        keep their default behavior (open in your browser).
+
+        Reading order on file open. When you switch into a file:
+          1. If there are unresolved global threads, the sidebar scrolls them
+             into view. Unread globals get auto-ack'd by you (NSFullUserName).
+          2. If there are unresolved inline (block-anchored) threads, the
+             content area auto-jumps to the first one with a yellow pulse.
+          3. The header chevrons (⌘[ / ⌘]) show a small red badge with the
+             count of unread global comments in the previous / next file
+             (caps at 9+). When you arrive at that file, the badge resets.
 
         """
         FileHandle.standardError.write(msg.data(using: .utf8)!)
@@ -1178,28 +1385,29 @@ enum CLI {
         guard !body.isEmpty else {
             FileHandle.standardError.write("--body is required\n".data(using: .utf8)!); return 2
         }
-        // CLI is overwhelmingly used by agents/scripts; default the author to "agent"
-        // so replies show up under the agent identity, not the local system user.
-        // Pass --author explicitly to override.
         let author = flagValue(args, "--author") ?? "agent"
+        let isGlobal = args.contains("--global")
         let url = resolveURL(file)
         guard FileManager.default.fileExists(atPath: url.path) else {
             FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
         }
         return MainActor.assumeIsolated {
-            // One-shot CLI invocation — don't double-emit on stdout; we'll print
-            // the resulting comment JSON ourselves below.
             let store = ReviewStore(fileURL: url, streamToStdout: false)
             let result: Comment?
             if let replyStr = flagValue(args, "--reply-to"), let replyId = UUID(uuidString: replyStr) {
+                // Replies inherit the root's scope; `--global` is ignored for replies.
                 result = store.addComment(line: 0, anchorText: "", body: body, replyTo: replyId, author: author)
+            } else if isGlobal {
+                result = store.addComment(line: 0, anchorText: "", body: body,
+                                          replyTo: nil, author: author, scope: .global)
             } else {
                 guard let lineStr = flagValue(args, "--line"), let line = Int(lineStr) else {
-                    FileHandle.standardError.write("--line is required (or --reply-to)\n".data(using: .utf8)!)
+                    FileHandle.standardError.write("--line is required (or --reply-to, or --global)\n".data(using: .utf8)!)
                     return 2
                 }
                 let (start, text) = nearestBlock(in: store.source, around: max(0, line - 1))
-                result = store.addComment(line: start, anchorText: text, body: body, replyTo: nil, author: author)
+                result = store.addComment(line: start, anchorText: text, body: body,
+                                          replyTo: nil, author: author, scope: .block)
             }
             guard let c = result else {
                 FileHandle.standardError.write("add failed\n".data(using: .utf8)!); return 1
@@ -1227,15 +1435,26 @@ enum CLI {
         guard FileManager.default.fileExists(atPath: url.path) else {
             FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
         }
+        let scopeFilter: CommentScope? = parseScopeFlag(args)
         return MainActor.assumeIsolated {
             let store = ReviewStore(fileURL: url, streamToStdout: false)
+            let filtered = scopeFilter.map { s in store.comments.filter { $0.scope == s } } ?? store.comments
             let enc = JSONEncoder()
             enc.dateEncodingStrategy = .iso8601
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            if let data = try? enc.encode(store.comments), let s = String(data: data, encoding: .utf8) {
+            if let data = try? enc.encode(filtered), let s = String(data: data, encoding: .utf8) {
                 print(s)
             }
             return 0
+        }
+    }
+
+    /// Parse `--scope block|global|all` from args. Returns nil for "all" (no filter).
+    private static func parseScopeFlag(_ args: [String]) -> CommentScope? {
+        switch flagValue(args, "--scope") {
+        case "block":  return .block
+        case "global": return .global
+        default:       return nil   // "all" or unspecified → no filter
         }
     }
 
@@ -1327,21 +1546,43 @@ enum CLI {
     static func cmdWatch(_ args: [String]) -> Int32 {
         let files = args.filter { !$0.hasPrefix("--") && !($0 == typesValue(args)) }
         guard !files.isEmpty else {
-            FileHandle.standardError.write("usage: human-review watch FILE.md [FILE2.md ...] [--from-start] [--types added,resolved,...]\n".data(using: .utf8)!)
+            FileHandle.standardError.write("usage: human-review watch FILE.md [FILE2.md ...] [--from-start] [--types LIST] [--no-ack] [--author NAME]\n".data(using: .utf8)!)
             return 2
         }
         let fromStart = args.contains("--from-start")
         let typesFilter: Set<String>? = typesValue(args).map { Set($0.split(separator: ",").map(String.init)) }
+        // Watcher = reader. Auto-ack every `added` event flowing through this
+        // watch under --author (default "agent"). Pass --no-ack to disable.
+        let ackOnSee = !args.contains("--no-ack")
+        let ackAuthor = flagValue(args, "--author") ?? "agent"
 
         let urls = files.map { resolveURL($0) }
         let logPaths = urls.map { EventLog.logURL(for: $0).path }
-        // Ensure each log file exists so `tail -F` doesn't bail out.
         for p in logPaths where !FileManager.default.fileExists(atPath: p) {
             FileManager.default.createFile(atPath: p, contents: nil)
         }
 
+        let onLine: ((String) -> Void)? = ackOnSee ? { line in
+            // Parse the event; ack `added` events whose author != ack_author.
+            guard let data = line.data(using: .utf8),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let event = obj["event"] as? String,
+                  event == "added",
+                  let filePath = obj["file"] as? String,
+                  let c = obj["comment"] as? [String: Any],
+                  let idStr = c["id"] as? String,
+                  let id = UUID(uuidString: idStr) else { return }
+            // Skip our own comments — we authored them, not "read" them.
+            if (c["author"] as? String) == ackAuthor { return }
+            let fileURL = URL(fileURLWithPath: filePath)
+            DispatchQueue.main.async {
+                let store = ReviewStore(fileURL: fileURL, streamToStdout: false)
+                store.ackComment(id, by: ackAuthor)
+            }
+        } : nil
+
         return tailAndFilter(logPaths: logPaths, fromStart: fromStart, typesFilter: typesFilter,
-                             stopOn: nil)
+                             stopOn: nil, onLine: onLine)
     }
 
     /// Block until a matching event lands. Mutually-exclusive modes:
@@ -1434,7 +1675,7 @@ enum CLI {
     /// List thread roots for a file. Defaults: all roots. --active / --settled filter.
     static func cmdThreads(_ args: [String]) -> Int32 {
         guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
-            FileHandle.standardError.write("usage: human-review threads FILE.md [--active|--settled]\n".data(using: .utf8)!)
+            FileHandle.standardError.write("usage: human-review threads FILE.md [--active|--settled] [--scope block|global|all]\n".data(using: .utf8)!)
             return 2
         }
         let url = resolveURL(file)
@@ -1443,11 +1684,13 @@ enum CLI {
         }
         let onlyActive = args.contains("--active")
         let onlySettled = args.contains("--settled")
+        let scopeFilter: CommentScope? = parseScopeFlag(args)
         return MainActor.assumeIsolated {
             let store = ReviewStore(fileURL: url, streamToStdout: false)
             var roots = store.threadRoots
             if onlyActive  { roots = roots.filter { !$0.resolved } }
             if onlySettled { roots = roots.filter {  $0.resolved } }
+            if let s = scopeFilter { roots = roots.filter { $0.scope == s } }
 
             // Augment each with replyCount
             let replyCounts: [UUID: Int] = Dictionary(grouping: store.comments.filter { $0.replyTo != nil },
@@ -1456,6 +1699,7 @@ enum CLI {
 
             struct ThreadSummary: Encodable {
                 let id: String
+                let scope: String
                 let anchorLine: Int
                 let anchorText: String
                 let body: String
@@ -1468,8 +1712,9 @@ enum CLI {
 
             let summaries = roots.map { r in
                 ThreadSummary(
-                    id: r.id.uuidString, anchorLine: r.anchorLine,
-                    anchorText: r.anchorText, body: r.body, author: r.author,
+                    id: r.id.uuidString, scope: r.scope.rawValue,
+                    anchorLine: r.anchorLine, anchorText: r.anchorText,
+                    body: r.body, author: r.author,
                     createdAt: r.createdAt, resolved: r.resolved,
                     orphaned: r.orphaned, replyCount: replyCounts[r.id] ?? 0
                 )
@@ -1562,7 +1807,8 @@ enum CLI {
         typesFilter: Set<String>?,
         stopOn predicate: ((String) -> Bool)?,
         timeout: Double? = nil,
-        printOnly: ((String) -> Bool)? = nil
+        printOnly: ((String) -> Bool)? = nil,
+        onLine: ((String) -> Void)? = nil
     ) -> Int32 {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
@@ -1631,12 +1877,14 @@ enum CLI {
                 let stop = predicate?(line) ?? false
                 if stop {
                     if shouldPrint { print(line); fflush(stdout) }
+                    onLine?(line)
                     exitCode.lock(); matched = true; exitCode.unlock()
                     task.terminate()
                     return
                 }
                 if shouldPrint && predicate == nil {
                     print(line); fflush(stdout)
+                    onLine?(line)
                 }
             }
         }
