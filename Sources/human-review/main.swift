@@ -293,9 +293,20 @@ final class ReviewStore: ObservableObject {
             return
         }
         let lines = source.components(separatedBy: "\n")
+        let lastValidLine = lines.count - 1
+
+        // Bucket block-scoped, non-orphan comments whose anchor still falls
+        // inside the current source. Anything else (globals, orphans, stale
+        // anchors past EOF after an external truncation) gets rendered in the
+        // separate "Document discussion" section at the bottom.
         var byAnchor: [Int: [Comment]] = [:]
-        for c in comments where !c.orphaned {
-            byAnchor[c.anchorLine, default: []].append(c)
+        var nonInline: [Comment] = []
+        for c in comments {
+            if c.scope == .global || c.orphaned || c.anchorLine < 0 || c.anchorLine > lastValidLine {
+                nonInline.append(c)
+            } else {
+                byAnchor[c.anchorLine, default: []].append(c)
+            }
         }
 
         var insertions: [(afterLine: Int, text: String)] = []
@@ -303,10 +314,11 @@ final class ReviewStore: ObservableObject {
         df.formatOptions = [.withFullDate]
 
         for (start, cs) in byAnchor {
-            // Find end-of-block.
+            // Find end-of-block. `start` is guaranteed to be in [0, lastValidLine]
+            // by the bucketing above; the range can't trap.
             var end = start
             var inFence = false
-            for i in start..<lines.count {
+            for i in start...lastValidLine {
                 let line = lines[i]
                 if line.range(of: #"^\s*(```|~~~)"#, options: .regularExpression) != nil {
                     inFence.toggle()
@@ -342,6 +354,41 @@ final class ReviewStore: ObservableObject {
         for ins in insertions.sorted(by: { $0.afterLine > $1.afterLine }) {
             let payload = ins.text.components(separatedBy: "\n")
             out.insert(contentsOf: payload, at: ins.afterLine + 1)
+        }
+
+        // Append a "Document discussion" section for global threads, orphans,
+        // and any comments whose anchorLine no longer maps into the source.
+        // Renders below the main body so reading flow stays clean.
+        let nonInlineRoots = nonInline.filter { $0.replyTo == nil }
+        if !nonInlineRoots.isEmpty {
+            out.append("")
+            out.append("---")
+            out.append("")
+            out.append("## Document discussion")
+            out.append("")
+            for root in nonInlineRoots.sorted(by: { $0.createdAt < $1.createdAt }) {
+                let allInThread = thread(rootedAt: root.id)
+                let resolvedMark = root.resolved ? " · ✓ resolved" : ""
+                let scopeMark: String
+                switch (root.scope, root.orphaned) {
+                case (.global, _):    scopeMark = " · whole-doc"
+                case (.block, true):  scopeMark = " · orphaned (anchor lost)"
+                case (.block, false): scopeMark = " · stale anchor"
+                }
+                out.append("> [!review]\(resolvedMark)\(scopeMark)")
+                for (i, c) in allInThread.enumerated() {
+                    let when = df.string(from: c.createdAt)
+                    let prefix = i == 0 ? "" : "→ "
+                    let bodyLines = c.body
+                        .components(separatedBy: "\n")
+                        .map { "> \($0)" }
+                        .joined(separator: "\n")
+                    out.append("> \(prefix)**\(c.author)** · \(when)")
+                    out.append(bodyLines)
+                    if i < allInThread.count - 1 { out.append(">") }
+                }
+                out.append("")
+            }
         }
 
         try? out.joined(separator: "\n").write(to: exportURL, atomically: true, encoding: .utf8)
