@@ -451,6 +451,41 @@
     white-space: pre-wrap;
   }
   /* Diagram zoom overlay — reuses the cross-link overlay container */
+  .diagram-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--code-bg);
+    user-select: none;
+  }
+  .diagram-btn {
+    font: inherit; font-size: 13px;
+    min-width: 32px;
+    padding: 3px 10px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .diagram-btn:hover { background: rgba(0,0,0,0.06); }
+  @media (prefers-color-scheme: dark) {
+    .diagram-btn:hover { background: rgba(255,255,255,0.08); }
+  }
+  .diagram-zoom-label {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    min-width: 56px;
+    text-align: center;
+    color: var(--muted);
+  }
+  .diagram-hint {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 11px;
+  }
   .diagram-stage {
     display: flex;
     align-items: center;
@@ -459,10 +494,18 @@
     height: 70vh;
     overflow: hidden;
     user-select: none;
+    cursor: grab;
+    background:
+      linear-gradient(45deg, var(--code-bg) 25%, transparent 25%) 0 0/16px 16px,
+      linear-gradient(-45deg, var(--code-bg) 25%, transparent 25%) 0 8px/16px 16px,
+      linear-gradient(45deg, transparent 75%, var(--code-bg) 75%) 8px -8px/16px 16px,
+      linear-gradient(-45deg, transparent 75%, var(--code-bg) 75%) -8px 0/16px 16px;
   }
+  .diagram-stage:active { cursor: grabbing; }
   .diagram-stage svg {
-    transition: transform 0.06s linear;
     transform-origin: center center;
+    max-width: none !important;   /* override marked.parse defaults so we can zoom past container */
+    max-height: none !important;
   }
   @media (prefers-color-scheme: dark) {
     .mermaid-error { color: #ff6b5e; }
@@ -649,8 +692,7 @@ function wrapMermaidBlocks(root) {
 }
 
 // Click-to-zoom overlay for diagrams. Reuses the cross-link overlay container
-// with a special diagram body: the SVG is centered and zoomable via wheel
-// (which is also how trackpad pinch is delivered: a wheel event with ctrlKey).
+// with a toolbar (zoom in/out/reset, %), drag-to-pan, and wheel/pinch zoom.
 function openDiagramOverlay(block) {
   const svg = block.querySelector('svg');
   if (!svg) return;
@@ -660,32 +702,89 @@ function openDiagramOverlay(block) {
   state.overlay = { kind: 'diagram' };
 
   body.innerHTML = '';
+
+  // Toolbar
+  const tb = document.createElement('div');
+  tb.className = 'diagram-toolbar';
+  tb.innerHTML = `
+    <button class="diagram-btn" data-z="out" title="Zoom out">−</button>
+    <button class="diagram-btn" data-z="in"  title="Zoom in">＋</button>
+    <span class="diagram-zoom-label">100%</span>
+    <button class="diagram-btn" data-z="fit"   title="Fit to window">Fit</button>
+    <button class="diagram-btn" data-z="reset" title="Reset to 100%">100%</button>
+    <span class="diagram-hint">drag to pan · wheel/pinch zooms · dbl-click resets</span>
+  `;
+  body.appendChild(tb);
+
+  // Stage
   const stage = document.createElement('div');
   stage.className = 'diagram-stage';
   const clone = svg.cloneNode(true);
   clone.removeAttribute('width');
   clone.removeAttribute('height');
-  clone.style.maxWidth = '100%';
-  clone.style.maxHeight = '100%';
   stage.appendChild(clone);
   body.appendChild(stage);
 
   let scale = 1, tx = 0, ty = 0;
-  const apply = () => { clone.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`; };
+  const label = tb.querySelector('.diagram-zoom-label');
+  const MIN = 0.2, MAX = 20;
+  const apply = () => {
+    clone.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    label.textContent = Math.round(scale * 100) + '%';
+  };
 
-  const onWheel = (e) => {
+  // Compute the scale that makes the SVG fit the stage (used by Fit and as
+  // the initial size).
+  const fitScale = () => {
+    const sr = stage.getBoundingClientRect();
+    const vb = clone.getBoundingClientRect();
+    if (!vb.width || !vb.height) return 1;
+    return Math.min(sr.width / (vb.width / scale), sr.height / (vb.height / scale)) * 0.95;
+  };
+
+  // Wheel + pinch (trackpad delivers pinch as wheel + ctrlKey).
+  stage.addEventListener('wheel', (e) => {
     if (!state.overlay || state.overlay.kind !== 'diagram') return;
     e.preventDefault();
-    // Trackpad pinch comes through as a wheel event with ctrlKey set.
-    const speed = e.ctrlKey ? 0.02 : 0.005;
-    scale = Math.min(8, Math.max(0.3, scale - e.deltaY * speed));
+    const speed = e.ctrlKey ? 0.025 : 0.006;
+    scale = Math.min(MAX, Math.max(MIN, scale - e.deltaY * speed));
+    apply();
+  }, { passive: false });
+
+  // Toolbar
+  tb.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-z]');
+    if (!btn) return;
+    const z = btn.getAttribute('data-z');
+    if (z === 'in')    scale = Math.min(MAX, scale * 1.25);
+    if (z === 'out')   scale = Math.max(MIN, scale / 1.25);
+    if (z === 'reset') { scale = 1; tx = 0; ty = 0; }
+    if (z === 'fit')   { scale = Math.min(MAX, Math.max(MIN, fitScale())); tx = 0; ty = 0; }
+    apply();
+  });
+
+  // Drag-to-pan
+  let dragging = false, startX = 0, startY = 0, startTx = 0, startTy = 0;
+  stage.addEventListener('mousedown', (e) => {
+    dragging = true;
+    startX = e.clientX; startY = e.clientY;
+    startTx = tx; startTy = ty;
+    e.preventDefault();
+  });
+  const onMove = (e) => {
+    if (!dragging) return;
+    tx = startTx + (e.clientX - startX);
+    ty = startTy + (e.clientY - startY);
     apply();
   };
-  body.addEventListener('wheel', onWheel, { passive: false });
+  const onUp = () => { dragging = false; };
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
 
-  // Reset on double click.
+  // Reset on double-click of the SVG.
   stage.addEventListener('dblclick', () => { scale = 1; tx = 0; ty = 0; apply(); });
 
+  apply();
   overlay.classList.add('visible');
   overlay.setAttribute('aria-hidden', 'false');
 }
