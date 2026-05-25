@@ -109,6 +109,10 @@ extension String {
 func emitEvent(_ ev: StreamEvent) {
     let enc = JSONEncoder()
     enc.dateEncodingStrategy = .iso8601
+    // .sortedKeys → canonical alphabetical key order. JSON spec doesn't care,
+    // but it lets simple regex consumers / line-grep tools rely on a stable
+    // shape across event types.
+    enc.outputFormatting = [.sortedKeys]
     if let data = try? enc.encode(ev), let s = String(data: data, encoding: .utf8) {
         print(s)
         fflush(stdout)
@@ -122,6 +126,7 @@ enum EventLog {
         let logURL = fileURL.appendingPathExtension("events.jsonl")
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
+        enc.outputFormatting = [.sortedKeys]
         guard var data = try? enc.encode(ev) else { return }
         data.append(0x0A)  // newline
         do {
@@ -140,7 +145,7 @@ enum EventLog {
 
     static func appendRaw(_ obj: [String: Any], for fileURL: URL) {
         let logURL = fileURL.appendingPathExtension("events.jsonl")
-        guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        guard var data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return }
         data.append(0x0A)
         do {
             if !FileManager.default.fileExists(atPath: logURL.path) {
@@ -794,7 +799,7 @@ final class ReviewSession: ObservableObject {
             "timestamp": ISO8601DateFormatter().string(from: Date()),
             "reason": reason, "raw": raw
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: payload),
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
            let s = String(data: data, encoding: .utf8) {
             print(s); fflush(stdout)
         }
