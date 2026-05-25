@@ -472,6 +472,10 @@
       startOnLoad: false,
       theme: darkMode ? 'dark' : 'default',
       securityLevel: 'loose',          // allow click handlers, etc. — local trust
+      // Prevent mermaid from injecting its "Syntax error in text" SVG anywhere
+      // outside the container we hand to render(). We surface errors inline
+      // via renderMermaidIn's catch block instead.
+      suppressErrorRendering: true,
       flowchart: { useMaxWidth: true },
       sequence: { useMaxWidth: true },
     });
@@ -588,8 +592,27 @@ async function renderMermaidIn(root) {
       err.className = 'mermaid-error';
       err.textContent = `mermaid render error:\n${(e && e.message) || e}\n\n--- source ---\n${src}`;
       pre.replaceWith(err);
+    } finally {
+      // Defensive cleanup: mermaid v11 sometimes leaves stray elements pinned
+      // to document.body (an "iframe" sandbox for parsing, or its own error
+      // SVG when suppressErrorRendering isn't honored). Sweep them.
+      cleanupMermaidStrays();
     }
   }
+}
+
+function cleanupMermaidStrays() {
+  // Remove any temp containers mermaid leaves on the body.
+  document.body.querySelectorAll(
+    'div[id^="dmmid-"], iframe[id^="iframemmid-"], svg[aria-roledescription="error"]'
+  ).forEach(el => {
+    if (el.parentElement === document.body) el.remove();
+  });
+  // Mermaid v11 in some failure modes appends a Syntax-error SVG directly
+  // to <body>; identify it by its 'error-icon' class.
+  document.body.querySelectorAll('svg.error').forEach(el => {
+    if (el.parentElement === document.body) el.remove();
+  });
 }
 
 // ─── thread grouping ───────────────────────────────────────────────────────────
