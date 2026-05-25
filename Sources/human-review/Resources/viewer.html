@@ -424,14 +424,57 @@
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   hr { border: none; border-top: 1px solid var(--border); margin: 1.4em 0; }
+
+  /* Mermaid diagram rendering — supplants <pre><code class="language-mermaid"> blocks. */
+  .mermaid-block {
+    margin: 0.8em 0;
+    padding: 8px;
+    border-radius: 8px;
+    background: var(--code-bg);
+    overflow-x: auto;
+    text-align: center;
+  }
+  .mermaid-block svg {
+    max-width: 100%;
+    height: auto;
+    display: inline-block;
+  }
+  .mermaid-error {
+    margin: 0.8em 0;
+    padding: 10px 12px;
+    border: 1px solid rgba(255,69,58,0.5);
+    background: rgba(255,69,58,0.10);
+    border-radius: 6px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    color: #c0392b;
+    white-space: pre-wrap;
+  }
+  @media (prefers-color-scheme: dark) {
+    .mermaid-error { color: #ff6b5e; }
+  }
 </style>
 <script src="marked.min.js"></script>
+<script src="mermaid.min.js"></script>
 <script>
   // Configure marked once. `breaks: true` makes single newlines render as <br>,
   // which is what chat-style comment bodies expect. `gfm: true` enables tables,
   // task lists, fenced code blocks, autolinks.
   if (window.marked && window.marked.setOptions) {
     marked.setOptions({ breaks: true, gfm: true });
+  }
+  // Mermaid diagrams in ```mermaid fenced blocks. We disable startOnLoad —
+  // we'll call mermaid.run() / mermaid.render() ourselves after every marked
+  // pass so dynamic re-renders (auto-reload, navigation) all pick up diagrams.
+  if (window.mermaid && mermaid.initialize) {
+    const darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: darkMode ? 'dark' : 'default',
+      securityLevel: 'loose',          // allow click handlers, etc. — local trust
+      flowchart: { useMaxWidth: true },
+      sequence: { useMaxWidth: true },
+    });
   }
 </script>
 </head>
@@ -518,6 +561,35 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   })[c]);
+}
+
+// ─── Mermaid post-processor ────────────────────────────────────────────────
+// Marked renders ```mermaid fenced blocks as <pre><code class="language-mermaid">.
+// After every render we walk those, ask mermaid to produce SVG, and swap them
+// in. Errors render as a small inline diagnostic so the user sees what broke.
+let _mmidCounter = 0;
+async function renderMermaidIn(root) {
+  if (!root || !window.mermaid || !mermaid.render) return;
+  const blocks = root.querySelectorAll('pre > code.language-mermaid');
+  if (blocks.length === 0) return;
+  for (const code of blocks) {
+    const src = code.textContent || '';
+    const id = `mmid-${Date.now()}-${++_mmidCounter}`;
+    const pre = code.parentElement;
+    if (!pre) continue;
+    try {
+      const { svg } = await mermaid.render(id, src);
+      const wrap = document.createElement('div');
+      wrap.className = 'mermaid-block';
+      wrap.innerHTML = svg;
+      pre.replaceWith(wrap);
+    } catch (e) {
+      const err = document.createElement('div');
+      err.className = 'mermaid-error';
+      err.textContent = `mermaid render error:\n${(e && e.message) || e}\n\n--- source ---\n${src}`;
+      pre.replaceWith(err);
+    }
+  }
 }
 
 // ─── thread grouping ───────────────────────────────────────────────────────────
@@ -738,6 +810,12 @@ function render() {
   // ── Render the global-chat sidebar ──────────────────────────────────────
   renderSidebar(threads);
 
+  // ── Render any ```mermaid``` diagrams in content + sidebar ──────────────
+  // Fire-and-forget — mermaid.render is async; the rest of the render path
+  // doesn't depend on diagrams being painted.
+  renderMermaidIn(document.getElementById('content'));
+  renderMermaidIn(document.getElementById('sidebar-threads'));
+
   // ── Read-receipt state promotion ─────────────────────────────────────────
   // Comments already known-read at the last render get .read added BEFORE
   // paint (no animation — they should appear settled). Newly-read ones get
@@ -765,11 +843,24 @@ function render() {
     lastRenderedReadState.set(c.id, (c.readBy || []).length > 0);
   }
 
-  // Auto-focus open composer textarea (preventScroll so viewport stays put)
-  const activeTextarea =
-    document.querySelector('.composer .primary[data-action="submit-new"]')?.closest('.composer')?.querySelector('textarea') ||
-    document.querySelector('.composer .primary[data-action="submit-reply"]')?.closest('.composer')?.querySelector('textarea');
-  if (activeTextarea) activeTextarea.focus({ preventScroll: true });
+  // Auto-focus ONLY a composer the user explicitly opened.
+  //
+  // Active threads always render a reply composer at the bottom (it's a
+  // standing affordance). If we auto-focused any composer we found, that
+  // textarea would grab focus on every render — silently swallowing 'n',
+  // 'j', arrow keys, etc. and breaking keyboard navigation entirely.
+  //
+  // Only focus when state explicitly says the user opened something:
+  //   - newComposerBlock set ⇒ a "new thread" composer is the active one
+  //   - replyComposerRoot set ⇒ a reply composer (e.g. for a settled thread
+  //     the user is reopening) is the active one
+  let toFocus = null;
+  if (state.newComposerBlock !== null) {
+    toFocus = document.querySelector(`.composer[data-composer-line="${state.newComposerBlock}"] textarea`);
+  } else if (state.replyComposerRoot !== null) {
+    toFocus = document.querySelector(`.thread[data-root="${state.replyComposerRoot}"] .composer textarea`);
+  }
+  if (toFocus) toFocus.focus({ preventScroll: true });
 }
 
 // ─── navigation between blocks ─────────────────────────────────────────────────
@@ -1090,6 +1181,8 @@ function showOverlay(payload) {
   ov.classList.add('visible');
   ov.setAttribute('aria-hidden', 'false');
   document.getElementById('overlay-body').scrollTop = 0;
+  // Render mermaid diagrams inside the linked-document overlay too.
+  renderMermaidIn(document.getElementById('overlay-body'));
 }
 
 function showOverlayError(payload) {
