@@ -450,6 +450,20 @@
     color: #c0392b;
     white-space: pre-wrap;
   }
+  /* Diagram zoom overlay — reuses the cross-link overlay container */
+  .diagram-stage {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 70vh;
+    overflow: hidden;
+    user-select: none;
+  }
+  .diagram-stage svg {
+    transition: transform 0.06s linear;
+    transform-origin: center center;
+  }
   @media (prefers-color-scheme: dark) {
     .mermaid-error { color: #ff6b5e; }
   }
@@ -571,34 +585,109 @@ function escapeHtml(s) {
 // Marked renders ```mermaid fenced blocks as <pre><code class="language-mermaid">.
 // After every render we walk those, ask mermaid to produce SVG, and swap them
 // in. Errors render as a small inline diagnostic so the user sees what broke.
-let _mmidCounter = 0;
+// Render every ```mermaid``` fenced block found under `root`.
+//
+// Two important details:
+//   1. We transform marked's <pre><code class="language-mermaid">SRC</code></pre>
+//      into <div class="mermaid">SRC</div> so we can hand them to mermaid.run().
+//   2. mermaid.run({nodes:...}) marks each node with data-processed="true" after
+//      it succeeds, so a second invocation (e.g. after the GUI auto-reloads the
+//      sidecar a few ms later) skips already-rendered diagrams. That fixes the
+//      original race: my previous per-block render() invoked async work on a
+//      <pre> reference, and a concurrent DOM rebuild orphaned the reference
+//      mid-flight — so the first paint had unrendered diagrams.
 async function renderMermaidIn(root) {
-  if (!root || !window.mermaid || !mermaid.render) return;
-  const blocks = root.querySelectorAll('pre > code.language-mermaid');
-  if (blocks.length === 0) return;
-  for (const code of blocks) {
+  if (!root || !window.mermaid) return;
+
+  // Step 1: marked → mermaid input shape (idempotent).
+  root.querySelectorAll('pre > code.language-mermaid').forEach(code => {
     const src = code.textContent || '';
-    const id = `mmid-${Date.now()}-${++_mmidCounter}`;
     const pre = code.parentElement;
-    if (!pre) continue;
-    try {
-      const { svg } = await mermaid.render(id, src);
-      const wrap = document.createElement('div');
-      wrap.className = 'mermaid-block';
-      wrap.innerHTML = svg;
-      pre.replaceWith(wrap);
-    } catch (e) {
-      const err = document.createElement('div');
-      err.className = 'mermaid-error';
-      err.textContent = `mermaid render error:\n${(e && e.message) || e}\n\n--- source ---\n${src}`;
-      pre.replaceWith(err);
-    } finally {
-      // Defensive cleanup: mermaid v11 sometimes leaves stray elements pinned
-      // to document.body (an "iframe" sandbox for parsing, or its own error
-      // SVG when suppressErrorRendering isn't honored). Sweep them.
-      cleanupMermaidStrays();
+    if (!pre || !pre.isConnected) return;
+    const div = document.createElement('div');
+    div.className = 'mermaid';
+    div.textContent = src;
+    pre.replaceWith(div);
+  });
+
+  const fresh = Array.from(root.querySelectorAll('.mermaid:not([data-processed="true"])'));
+  if (fresh.length === 0) {
+    // Already-processed diagrams may need to be wrapped (e.g. after an external
+    // re-render that lost wrappers). Just re-wrap what we find.
+    wrapMermaidBlocks(root);
+    return;
+  }
+
+  try {
+    await mermaid.run({ nodes: fresh, suppressErrors: false });
+  } catch (e) {
+    for (const node of fresh) {
+      if (!node.querySelector('svg')) {
+        node.className = 'mermaid-error';
+        node.textContent = `mermaid render error:\n${(e && e.message) || e}\n\n--- source ---\n${node.textContent}`;
+        node.removeAttribute('data-processed');
+      }
     }
   }
+  wrapMermaidBlocks(root);
+  cleanupMermaidStrays();
+}
+
+// Wrap each successfully-rendered .mermaid in a .mermaid-block with a
+// click-to-zoom affordance. Idempotent via data-wrapped.
+function wrapMermaidBlocks(root) {
+  root.querySelectorAll('.mermaid[data-processed="true"]:not([data-wrapped="1"])').forEach(t => {
+    t.setAttribute('data-wrapped', '1');
+    const block = document.createElement('div');
+    block.className = 'mermaid-block';
+    block.title = 'Click to enlarge';
+    block.style.cursor = 'zoom-in';
+    while (t.firstChild) block.appendChild(t.firstChild);
+    t.replaceWith(block);
+    block.addEventListener('click', () => openDiagramOverlay(block));
+  });
+}
+
+// Click-to-zoom overlay for diagrams. Reuses the cross-link overlay container
+// with a special diagram body: the SVG is centered and zoomable via wheel
+// (which is also how trackpad pinch is delivered: a wheel event with ctrlKey).
+function openDiagramOverlay(block) {
+  const svg = block.querySelector('svg');
+  if (!svg) return;
+  const overlay = document.getElementById('overlay');
+  const body = document.getElementById('overlay-body');
+  document.getElementById('overlay-path').textContent = 'Diagram';
+  state.overlay = { kind: 'diagram' };
+
+  body.innerHTML = '';
+  const stage = document.createElement('div');
+  stage.className = 'diagram-stage';
+  const clone = svg.cloneNode(true);
+  clone.removeAttribute('width');
+  clone.removeAttribute('height');
+  clone.style.maxWidth = '100%';
+  clone.style.maxHeight = '100%';
+  stage.appendChild(clone);
+  body.appendChild(stage);
+
+  let scale = 1, tx = 0, ty = 0;
+  const apply = () => { clone.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`; };
+
+  const onWheel = (e) => {
+    if (!state.overlay || state.overlay.kind !== 'diagram') return;
+    e.preventDefault();
+    // Trackpad pinch comes through as a wheel event with ctrlKey set.
+    const speed = e.ctrlKey ? 0.02 : 0.005;
+    scale = Math.min(8, Math.max(0.3, scale - e.deltaY * speed));
+    apply();
+  };
+  body.addEventListener('wheel', onWheel, { passive: false });
+
+  // Reset on double click.
+  stage.addEventListener('dblclick', () => { scale = 1; tx = 0; ty = 0; apply(); });
+
+  overlay.classList.add('visible');
+  overlay.setAttribute('aria-hidden', 'false');
 }
 
 function cleanupMermaidStrays() {
