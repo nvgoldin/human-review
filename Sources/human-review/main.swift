@@ -643,6 +643,9 @@ final class ReviewStore: ObservableObject {
 final class ReviewSession: ObservableObject {
     @Published var currentIndex: Int = 0
     @Published var urls: [URL]
+    /// WKWebView pageZoom multiplier — persists across file navigation so a
+    /// resized session stays sized. 1.0 = native, range clamped to [0.5, 3.0].
+    @Published var pageZoom: CGFloat = 1.0
     let stream: Bool
     let emitOnExit: Bool
     var suppressExitEvent: Bool = false
@@ -719,6 +722,10 @@ final class ReviewSession: ObservableObject {
         autoAckCurrentGlobals()
         return true
     }
+
+    func zoomIn()    { pageZoom = min(3.0, (pageZoom * 10).rounded() / 10 + 0.1) }
+    func zoomOut()   { pageZoom = max(0.5, (pageZoom * 10).rounded() / 10 - 0.1) }
+    func zoomReset() { pageZoom = 1.0 }
 
     /// Count of unread (by `humanName`) global comments in the file at
     /// `index`. Used by HeaderBar to draw the chevron badge.
@@ -1040,6 +1047,8 @@ struct MarkdownWebView: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
+        webView.allowsMagnification = true                  // pinch-to-zoom on trackpads
+        if let s = session { webView.pageZoom = s.pageZoom }
 
         if let url = Bundle.module.url(forResource: "viewer", withExtension: "html") {
             webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
@@ -1057,6 +1066,7 @@ struct MarkdownWebView: NSViewRepresentable {
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.store = store
         context.coordinator.session = session
+        if let s = session, webView.pageZoom != s.pageZoom { webView.pageZoom = s.pageZoom }
         Self.pushState(webView: webView, store: store)
     }
 
@@ -2056,6 +2066,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         r.target = self; fm.addItem(r)
         fileItem.submenu = fm
 
+        // View menu — zoom
+        let viewItem = NSMenuItem()
+        main.addItem(viewItem)
+        let vm = NSMenu(title: "View")
+        let zi = NSMenuItem(title: "Zoom In", action: #selector(zoomInAction), keyEquivalent: "+")
+        zi.target = self; vm.addItem(zi)
+        let zo = NSMenuItem(title: "Zoom Out", action: #selector(zoomOutAction), keyEquivalent: "-")
+        zo.target = self; vm.addItem(zo)
+        let zr = NSMenuItem(title: "Actual Size", action: #selector(zoomResetAction), keyEquivalent: "0")
+        zr.target = self; vm.addItem(zr)
+        viewItem.submenu = vm
+
         let editItem = NSMenuItem()
         main.addItem(editItem)
         let em = NSMenu(title: "Edit")
@@ -2074,6 +2096,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func nextAction()   { session.next() }
     @objc func prevAction()   { session.previous() }
     @objc func reloadAction() { session.current.reload() }
+    @objc func zoomInAction()    { session.zoomIn() }
+    @objc func zoomOutAction()   { session.zoomOut() }
+    @objc func zoomResetAction() { session.zoomReset() }
 }
 
 // MARK: - Entry
