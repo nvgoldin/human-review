@@ -65,11 +65,43 @@
 
   .sidebar-scroll {
     flex: 1;
+    min-height: 0;     /* allow shrinking below content's intrinsic size so overflow-y kicks in */
     overflow-y: auto;
     padding: 10px;
     display: flex;
     flex-direction: column;
     gap: 10px;
+  }
+  /* Sidebar thread cards are click-targets for reply-mode (composer at the
+     bottom switches to "Reply" for that thread). */
+  #sidebar-threads .thread { cursor: pointer; }
+  #sidebar-threads .thread.replying {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  /* Reply banner above the global composer */
+  .sidebar-reply-banner {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px;
+    margin-bottom: 6px;
+    border-radius: 5px;
+    background: rgba(10,132,255,0.08);
+    border: 1px solid rgba(10,132,255,0.25);
+    font-size: 11.5px;
+    color: var(--fg);
+  }
+  .sidebar-reply-banner .snippet {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+  }
+  .sidebar-reply-banner button {
+    background: transparent; border: none; cursor: pointer;
+    color: var(--muted); padding: 0 4px; font-size: 13px;
   }
   .sidebar-empty {
     margin: 12px;
@@ -585,6 +617,9 @@ const state = {
   expandedSettled: new Set(),  // root ids of settled threads the user has expanded
   initialJumpDone: false,      // we auto-focus the first active thread on file open
   overlay: null,               // {path, fragment} when overlay is open
+  sidebarReplyTo: null,        // root id of a global thread to reply to via the bottom composer
+  pendingAttention: null,      // UUID requested by agent via `attention` — focus once, then clear
+  attentionShown: new Set(),   // ids we've already focused (so we don't re-focus on every render)
 };
 
 // Tracks the read state we last applied per comment id. Used to decide whether
@@ -921,14 +956,15 @@ function renderComposer({ placeholder, primaryLabel, action, dataAttrs, hint }) 
   `;
 }
 
-function renderThread(t) {
+function renderThread(t, inSidebar) {
   const settled = t.root.resolved;
   const expanded = !settled || state.expandedSettled.has(t.root.id);
   const replyOpen = state.replyComposerRoot === t.root.id;
   const count = t.comments.length;
   const focusedSidebar = (t.root.scope === 'global' && state.focusedSidebarThread === t.root.id);
+  const sidebarReplying = inSidebar && state.sidebarReplyTo === t.root.id;
 
-  let html = `<div class="thread ${settled ? 'settled' : ''} ${settled && !expanded ? 'collapsed' : ''} ${focusedSidebar ? 'focused-sidebar' : ''}"
+  let html = `<div class="thread ${settled ? 'settled' : ''} ${settled && !expanded ? 'collapsed' : ''} ${focusedSidebar ? 'focused-sidebar' : ''} ${sidebarReplying ? 'replying' : ''}"
                    data-root="${escapeHtml(t.root.id)}">`;
   // Head
   html += `<div class="thread-head" data-action="${settled ? 'toggle-thread' : ''}" data-root="${escapeHtml(t.root.id)}">
@@ -947,7 +983,10 @@ function renderThread(t) {
   // Body
   html += `<div class="thread-body">`;
   for (const c of t.comments) html += renderComment(c);
-  if (!settled || replyOpen) {
+  // Sidebar threads never get their own composer — the user replies via the
+  // single pinned composer at the bottom of the sidebar (click the thread to
+  // put that composer in reply mode).
+  if (!inSidebar && (!settled || replyOpen)) {
     html += renderComposer({
       placeholder: settled ? 'Reply (will re-open this thread)…' : 'Reply to this thread…',
       primaryLabel: settled ? 'Reply & reopen' : 'Reply',
@@ -1338,9 +1377,31 @@ function renderSidebar(threads) {
   }
   if (items.length === 0) {
     wrap.innerHTML = `<div class="sidebar-empty">No messages yet. Use this for whole-document comments — start a thread with the composer below.</div>`;
-    return;
+  } else {
+    wrap.innerHTML = items.map(t => renderThread(t, true)).join('');
   }
-  wrap.innerHTML = items.map(t => renderThread(t)).join('');
+
+  // Update the sidebar composer's reply banner + placeholder/button based on
+  // whether the user has clicked a thread (state.sidebarReplyTo).
+  const composer = document.getElementById('sidebar-composer');
+  if (!composer) return;
+  const ta = composer.querySelector('textarea');
+  const btn = composer.querySelector('.primary');
+  const oldBanner = composer.querySelector('.sidebar-reply-banner');
+  if (oldBanner) oldBanner.remove();
+  if (state.sidebarReplyTo) {
+    const replyRoot = state.comments.find(c => c.id === state.sidebarReplyTo);
+    const snippet = replyRoot ? (replyRoot.body || '').replace(/\n/g, ' ').slice(0, 60) : '';
+    const banner = document.createElement('div');
+    banner.className = 'sidebar-reply-banner';
+    banner.innerHTML = `<span>↩ Replying to:</span><span class="snippet">${escapeHtml(snippet)}</span><button data-action="cancel-sidebar-reply" title="Cancel reply">✕</button>`;
+    composer.insertBefore(banner, composer.firstChild);
+    if (ta) ta.placeholder = 'Reply to this thread… (will re-open if settled)';
+    if (btn) btn.textContent = 'Reply';
+  } else {
+    if (ta) ta.placeholder = 'Send a message about this document…';
+    if (btn) btn.textContent = 'Send';
+  }
 }
 
 // ─── Cross-link overlay ──────────────────────────────────────────────────
@@ -1445,31 +1506,78 @@ document.addEventListener('click', (e) => {
     const ta = composer.querySelector('textarea');
     const body = (ta.value || '').trim();
     if (!body) return;
-    postSwift({ type: 'addGlobal', body });
+    if (state.sidebarReplyTo) {
+      // Bottom composer is in reply mode → post as reply to that thread.
+      postSwift({ type: 'addComment', replyTo: state.sidebarReplyTo, body });
+      state.sidebarReplyTo = null;
+    } else {
+      postSwift({ type: 'addGlobal', body });
+    }
     ta.value = '';
+    render();
     return;
   }
+  if (action === 'cancel-sidebar-reply') {
+    state.sidebarReplyTo = null;
+    render();
+    return;
+  }
+
+  // Click anywhere on a sidebar thread (outside its own buttons) → set up
+  // bottom-composer reply mode targeting that thread.
+  const sidebarThread = e.target.closest && e.target.closest('#sidebar-threads .thread');
+  if (sidebarThread && !e.target.closest('button') && !e.target.closest('.composer')) {
+    const root = sidebarThread.getAttribute('data-root');
+    if (root) {
+      state.sidebarReplyTo = root;
+      render();
+      // Focus the bottom composer's textarea
+      const ta = document.querySelector('#sidebar-composer textarea');
+      if (ta) ta.focus({ preventScroll: true });
+    }
+  }
 });
+
+function focusComment(id) {
+  if (!id) return;
+  const c = state.comments.find(cm => cm.id === id);
+  if (!c) return;
+  // Find the thread root so we know where to land.
+  const idx = new Map(state.comments.map(c => [c.id, c]));
+  let root = c;
+  let safety = 0;
+  while (root.replyTo && safety++ < 100) { root = idx.get(root.replyTo) || root; }
+  if (root.scope === 'global') {
+    state.focusedSidebarThread = root.id;
+    state.focusedBlock = null;
+    render();
+    scrollSidebarThreadIntoView(root.id);
+    pulseSidebarThread(root.id);
+  } else {
+    state.focusedBlock = root.anchorLine;
+    state.focusedSidebarThread = null;
+    render();
+    scrollFocusedIntoView();
+    pulseBlock(root.anchorLine);
+  }
+}
 
 window.hr = {
   applyState(payload) {
     state.blocks = splitBlocks(payload.source || '');
     state.comments = payload.comments || [];
     render();
-    // On first render of this file, if there are unresolved threads, jump
-    // straight to the first one — saves the user a scroll-and-hunt step.
-    if (!state.initialJumpDone) {
-      const actives = activeThreadLines(buildThreads());
-      if (actives.length) {
-        state.focusedBlock = actives[0];
-        state.initialJumpDone = true;
-        render();
-        scrollFocusedIntoView();
-        pulseBlock(actives[0]);
-      } else {
-        state.initialJumpDone = true;
-      }
+    // Attention: an agent has explicitly requested the user's focus on a
+    // specific comment via `human-review attention …`. Honor it once, then
+    // tell Swift to clear the sidecar flag so we don't keep refocusing.
+    const want = payload.pendingAttention || null;
+    if (want && !state.attentionShown.has(want)) {
+      state.attentionShown.add(want);
+      focusComment(want);
+      postSwift({ type: 'clearAttention' });
     }
+    // (No auto-jump on file open — the user stays where they were. Agents
+    // that want to draw attention must use `attention`.)
   },
   showOverlay,
   showOverlayError,

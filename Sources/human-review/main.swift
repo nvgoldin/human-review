@@ -72,11 +72,30 @@ struct CommentFile: Codable {
     var file: String
     var sourceHash: String
     var comments: [Comment]
+    /// Set by `human-review attention …` to ask the GUI to focus on a specific
+    /// comment. GUI clears it after acting so it doesn't keep re-focusing.
+    var pendingAttention: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case file, sourceHash, comments, pendingAttention
+    }
+    init(file: String, sourceHash: String, comments: [Comment], pendingAttention: String? = nil) {
+        self.file = file; self.sourceHash = sourceHash
+        self.comments = comments; self.pendingAttention = pendingAttention
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.file = try c.decode(String.self, forKey: .file)
+        self.sourceHash = try c.decode(String.self, forKey: .sourceHash)
+        self.comments = try c.decode([Comment].self, forKey: .comments)
+        self.pendingAttention = try c.decodeIfPresent(String.self, forKey: .pendingAttention)
+    }
 }
 
 struct ViewerPayload: Codable {
     let source: String
     let comments: [Comment]
+    let pendingAttention: String?
 }
 
 struct FileSummary: Codable {
@@ -178,6 +197,9 @@ final class ReviewStore: ObservableObject {
     @Published var source: String = ""
     @Published var comments: [Comment] = []
     @Published var statusMessage: String = ""
+    /// Comment id the GUI should focus next, set by `attention`. Persisted in
+    /// the sidecar so it survives across processes / GUI restarts.
+    @Published var pendingAttention: UUID? = nil
 
     let fileURL: URL
     let sidecarURL: URL
@@ -233,6 +255,7 @@ final class ReviewStore: ObservableObject {
             let loaded = try dec.decode(CommentFile.self, from: data)
             comments = loaded.comments.sorted { $0.createdAt < $1.createdAt }
             anchoredSourceHash = loaded.sourceHash
+            pendingAttention = loaded.pendingAttention.flatMap { UUID(uuidString: $0) }
             lastWrittenSidecarHash = h
             statusMessage = "External update · \(comments.count) comments"
         } catch {
@@ -260,6 +283,7 @@ final class ReviewStore: ObservableObject {
                 // overall for stable display.
                 comments = loaded.comments.sorted { $0.createdAt < $1.createdAt }
                 anchoredSourceHash = loaded.sourceHash
+                pendingAttention = loaded.pendingAttention.flatMap { UUID(uuidString: $0) }
             } catch {
                 statusMessage = "Failed to load sidecar: \(error.localizedDescription)"
             }
@@ -272,7 +296,8 @@ final class ReviewStore: ObservableObject {
         let payload = CommentFile(
             file: fileURL.lastPathComponent,
             sourceHash: hash,
-            comments: comments
+            comments: comments,
+            pendingAttention: pendingAttention?.uuidString
         )
         do {
             let enc = JSONEncoder()
@@ -503,6 +528,21 @@ final class ReviewStore: ObservableObject {
 
     /// Mark a comment as read by `reader`. No-op if reader is the comment's own
     /// author, or already in readBy. Emits a `read` event on success.
+    /// Mark `id` as the comment the GUI should focus next. Persisted in the
+    /// sidecar so it survives across processes. GUI clears via clearAttention()
+    /// after acting so subsequent renders don't keep refocusing.
+    func setAttention(_ id: UUID) {
+        pendingAttention = id
+        saveSidecar()
+        emit(event: "attention", comment: comments.first(where: { $0.id == id }))
+    }
+
+    func clearAttention() {
+        if pendingAttention == nil { return }
+        pendingAttention = nil
+        saveSidecar()
+    }
+
     @discardableResult
     func ackComment(_ id: UUID, by reader: String) -> Bool {
         guard let idx = comments.firstIndex(where: { $0.id == id }) else { return false }
@@ -888,6 +928,18 @@ final class CommandRouter {
                       let id = UUID(uuidString: idStr) else { throw CmdErr.missing("id") }
                 let by = (obj["author"] as? String) ?? "agent"
                 store.ackComment(id, by: by)
+            case "attention":
+                let store = try resolveStore(session, obj)
+                guard let idStr = obj["id"] as? String,
+                      let id = UUID(uuidString: idStr) else { throw CmdErr.missing("id") }
+                if store.comments.contains(where: { $0.id == id }) {
+                    store.setAttention(id)
+                } else {
+                    throw CmdErr.unknown("comment not found: \(idStr)")
+                }
+            case "clearAttention":
+                let store = try resolveStore(session, obj)
+                store.clearAttention()
             case "reload":
                 try resolveStore(session, obj).reload()
             case "open":
@@ -972,6 +1024,8 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
             Task { @MainActor in self.session?.next() }
         case "prevFile":
             Task { @MainActor in self.session?.previous() }
+        case "clearAttention":
+            Task { @MainActor in self.store?.clearAttention() }
         case "addGlobal":
             guard let body = dict["body"] as? String, !body.isEmpty else { return }
             Task { @MainActor in
@@ -1071,7 +1125,11 @@ struct MarkdownWebView: NSViewRepresentable {
     }
 
     static func pushState(webView: WKWebView, store: ReviewStore) {
-        let payload = ViewerPayload(source: store.source, comments: store.comments)
+        let payload = ViewerPayload(
+            source: store.source,
+            comments: store.comments,
+            pendingAttention: store.pendingAttention?.uuidString
+        )
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
         guard let data = try? enc.encode(payload),
@@ -1201,7 +1259,7 @@ enum CLI {
 
         let subcommands: Set<String> = [
             "add", "list", "export", "delete", "resolve", "reopen", "reload",
-            "watch", "wait", "threads", "get", "prune", "ack",
+            "watch", "wait", "threads", "get", "prune", "ack", "attention",
             "help", "-h", "--help"
         ]
         if subcommands.contains(args[0]) {
@@ -1220,6 +1278,7 @@ enum CLI {
             case "get":     return cmdGet(Array(args.dropFirst()))
             case "prune":   return cmdPrune(Array(args.dropFirst()))
             case "ack":     return cmdAck(Array(args.dropFirst()))
+            case "attention": return cmdAttention(Array(args.dropFirst()))
             default: break
             }
         }
@@ -1813,6 +1872,31 @@ enum CLI {
             if ack { store.ackComment(id, by: author) }
             guard let c = store.comments.first(where: { $0.id == id }) else { return 1 }
             printJSON(c)
+            return 0
+        }
+    }
+
+    /// Ask the GUI to focus on a specific comment (scroll + pulse). Persisted
+    /// in the sidecar's pendingAttention field; the GUI clears it after acting.
+    static func cmdAttention(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("usage: human-review attention FILE.md --id UUID\n".data(using: .utf8)!)
+            return 2
+        }
+        guard let idStr = flagValue(args, "--id"), let id = UUID(uuidString: idStr) else {
+            FileHandle.standardError.write("--id UUID required\n".data(using: .utf8)!); return 2
+        }
+        let url = resolveURL(file)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
+        }
+        return MainActor.assumeIsolated {
+            let store = ReviewStore(fileURL: url, streamToStdout: true)
+            guard store.comments.contains(where: { $0.id == id }) else {
+                FileHandle.standardError.write("comment not found: \(idStr)\n".data(using: .utf8)!); return 1
+            }
+            store.setAttention(id)
+            printJSON(["file": url.path, "attention": idStr])
             return 0
         }
     }
