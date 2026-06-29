@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>human-review</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.nadav.human-review</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>human-review</string>
+    <key>CFBundleDisplayName</key>
+    <string>human-review</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <!-- macOS dictation (Fn-Fn, Edit → Start Dictation, or the 🎤 button in
+         composers) uses the system speech-recognition + microphone pipeline.
+         TCC requires both purpose strings before it will grant access. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Dictate comments using macOS dictation (Fn-Fn or the microphone button in the composer).</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Convert your dictated speech into text inside review comments.</string>
+</dict>
+</plist>

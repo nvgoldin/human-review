@@ -96,6 +96,15 @@ struct ViewerPayload: Codable {
     let source: String
     let comments: [Comment]
     let pendingAttention: String?
+    /// Current WKWebView pageZoom multiplier (1.0 = native). The JS uses this
+    /// to render the floating zoom indicator (e.g. "120%"). Swift owns the
+    /// authoritative value; JS sends zoomIn/zoomOut/zoomReset messages.
+    let pageZoom: Double
+    /// Lowercase file extension with no leading dot (`md`, `py`, `txt`, `js`, …).
+    /// Empty for files with no extension. JS uses this to branch between the
+    /// markdown renderer (marked.js + mermaid) and per-line syntax-highlighted
+    /// code rendering (highlight.js).
+    let fileExt: String
 }
 
 struct FileSummary: Codable {
@@ -1024,6 +1033,31 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
             Task { @MainActor in self.session?.next() }
         case "prevFile":
             Task { @MainActor in self.session?.previous() }
+        case "zoomIn", "zoomOut", "zoomReset":
+            // SessionWindow's @ObservedObject re-renders SessionWindow but
+            // doesn't necessarily re-run MarkdownWebView.updateNSView for a
+            // reference-type session whose pageZoom changed in place. Apply
+            // the change directly to the webView here, then update the
+            // session model so SwiftUI's state stays in sync and other
+            // observers (zoom % indicator pushed via applyState, future
+            // file-switch initial zoom) see the new value.
+            let webView = message.webView
+            Task { @MainActor in
+                guard let session = self.session else { return }
+                switch type {
+                case "zoomIn":    session.zoomIn()
+                case "zoomOut":   session.zoomOut()
+                case "zoomReset": session.zoomReset()
+                default: break
+                }
+                if let webView = webView, webView.pageZoom != session.pageZoom {
+                    webView.pageZoom = session.pageZoom
+                }
+                // Push the new pageZoom to JS so the floating widget updates.
+                if let webView = webView, let store = self.store {
+                    MarkdownWebView.pushState(webView: webView, store: store, pageZoom: session.pageZoom)
+                }
+            }
         case "clearAttention":
             Task { @MainActor in self.store?.clearAttention() }
         case "addGlobal":
@@ -1082,6 +1116,27 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
     }
 }
 
+/// Resource bundle lookup that works in both dev (`./install.sh` produces a
+/// raw `.build/release/` layout) and prod (`~/Applications/human-review.app/`).
+///
+/// SwiftPM's generated `Bundle.module` accessor expects the resource
+/// `.bundle` to sit at `Bundle.main.bundleURL/<name>.bundle`. For an `.app`,
+/// that path resolves to the `.app` root — but Gatekeeper / `codesign`
+/// reject "unsealed contents present in the bundle root" if anything sits
+/// next to `Contents/`. So we place the resource bundle inside
+/// `Contents/Resources/` (the conventional spot) and prefer that location
+/// when looking up resources at runtime. We fall back to `Bundle.module`
+/// for unbundled dev runs.
+enum AppResources {
+    static let bundle: Bundle = {
+        let name = "human-review_human-review.bundle"
+        let candidate = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Resources/\(name)")
+        if let b = Bundle(url: candidate) { return b }
+        return Bundle.module
+    }()
+}
+
 struct MarkdownWebView: NSViewRepresentable {
     @ObservedObject var store: ReviewStore
     var session: ReviewSession?
@@ -1102,17 +1157,25 @@ struct MarkdownWebView: NSViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsMagnification = true                  // pinch-to-zoom on trackpads
+        // Safari Web Inspector → Develop ▸ <your machine> ▸ human-review.
+        // Requires Safari ▸ Settings ▸ Advanced ▸ "Show Develop menu in menu bar".
+        // The Package.swift platform floor is macOS 13.0; isInspectable
+        // shipped in 13.3, so we have to guard.
+        if #available(macOS 13.3, *) {
+            webView.isInspectable = true
+        }
         if let s = session { webView.pageZoom = s.pageZoom }
 
-        if let url = Bundle.module.url(forResource: "viewer", withExtension: "html") {
+        if let url = AppResources.bundle.url(forResource: "viewer", withExtension: "html") {
             webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         } else {
             webView.loadHTMLString("<h1>viewer.html missing</h1>", baseURL: nil)
         }
 
+        let initialZoom = session?.pageZoom ?? 1.0
         context.coordinator.onReady = { [weak webView] in
             guard let webView = webView else { return }
-            Self.pushState(webView: webView, store: store)
+            Self.pushState(webView: webView, store: store, pageZoom: initialZoom)
         }
         return webView
     }
@@ -1121,14 +1184,16 @@ struct MarkdownWebView: NSViewRepresentable {
         context.coordinator.store = store
         context.coordinator.session = session
         if let s = session, webView.pageZoom != s.pageZoom { webView.pageZoom = s.pageZoom }
-        Self.pushState(webView: webView, store: store)
+        Self.pushState(webView: webView, store: store, pageZoom: session?.pageZoom ?? webView.pageZoom)
     }
 
-    static func pushState(webView: WKWebView, store: ReviewStore) {
+    static func pushState(webView: WKWebView, store: ReviewStore, pageZoom: CGFloat = 1.0) {
         let payload = ViewerPayload(
             source: store.source,
             comments: store.comments,
-            pendingAttention: store.pendingAttention?.uuidString
+            pendingAttention: store.pendingAttention?.uuidString,
+            pageZoom: Double(pageZoom),
+            fileExt: store.fileURL.pathExtension.lowercased()
         )
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
@@ -2106,6 +2171,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         router.start()
     }
 
+    // Earlier versions of this file tried to warm up the microphone + speech-
+    // recognition TCC prompts on launch by calling AVCaptureDevice.requestAccess
+    // and SFSpeechRecognizer.requestAuthorization here. The latter crashes the
+    // process on macOS 15+ when the binary is launched via a terminal symlink
+    // (Bundle.main resolves to the symlink's parent dir, not the .app, so
+    // TCC can't find NSSpeechRecognitionUsageDescription even though it's in
+    // Contents/Info.plist). Both warm-ups are unnecessary anyway:
+    //
+    //   - Fn-Fn dictation runs inside the system Dictation daemon, which
+    //     handles its own microphone permissions. The user is prompted when
+    //     they first enable dictation in System Settings — not by us.
+    //   - Microphone access via our own process isn't required: we never call
+    //     getUserMedia or open an audio session ourselves.
+    //
+    // If we later add a custom in-app dictation UI (SFSpeechRecognizer), we'd
+    // need to either guard the call with a Bundle.main path check or relaunch
+    // the process via `open` to ensure the .app's Info.plist is authoritative.
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationWillTerminate(_ notification: Notification) { session.emitExit() }
 
@@ -2151,14 +2234,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fileItem.submenu = fm
 
         // View menu — zoom
+        //
+        // NSMenuItem(keyEquivalent: "+") defaults to modifierMask = [.command]
+        // but on US keyboards "+" requires Shift, so ⌘+ never actually fires
+        // the menu item. We must explicitly set [.command, .shift] for "+".
+        // We also bind an extra "=" item so ⌘= works without Shift.
         let viewItem = NSMenuItem()
         main.addItem(viewItem)
         let vm = NSMenu(title: "View")
         let zi = NSMenuItem(title: "Zoom In", action: #selector(zoomInAction), keyEquivalent: "+")
+        zi.keyEquivalentModifierMask = [.command, .shift]
         zi.target = self; vm.addItem(zi)
+        // Hidden alternate so ⌘= (no Shift) also zooms in — common Apple convention.
+        let ziAlt = NSMenuItem(title: "Zoom In", action: #selector(zoomInAction), keyEquivalent: "=")
+        ziAlt.keyEquivalentModifierMask = [.command]
+        ziAlt.isAlternate = true
+        ziAlt.isHidden = true
+        ziAlt.target = self; vm.addItem(ziAlt)
         let zo = NSMenuItem(title: "Zoom Out", action: #selector(zoomOutAction), keyEquivalent: "-")
+        zo.keyEquivalentModifierMask = [.command]
         zo.target = self; vm.addItem(zo)
         let zr = NSMenuItem(title: "Actual Size", action: #selector(zoomResetAction), keyEquivalent: "0")
+        zr.keyEquivalentModifierMask = [.command]
         zr.target = self; vm.addItem(zr)
         viewItem.submenu = vm
 
@@ -2172,6 +2269,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         em.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
         em.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
         em.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        // No manual "Start Dictation…" menu item: the `startDictation:`
+        // selector isn't implemented by WKWebView's internal text inputs, so
+        // a menu item would beep the same way. Users get dictation via the
+        // system shortcut (Fn-Fn) — that's app-agnostic and works inside the
+        // WKWebView once TCC has been seeded (done from primeDictationPermissions).
         editItem.submenu = em
 
         NSApp.mainMenu = main

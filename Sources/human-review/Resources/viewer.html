@@ -38,9 +38,24 @@
     font-size: 14.5px; line-height: 1.55;
     color: var(--fg); background: var(--bg);
   }
-  /* Reserve the right edge for the chat sidebar so #content doesn't sit under it. */
+  /* Lock the viewport. The DOC scrolls inside #content (its scrollbar lives
+     to the LEFT of the chat sidebar) and the SIDEBAR scrolls inside
+     #sidebar-threads (its scrollbar lives at the window edge). With these
+     in separate stacking regions, there's no ambiguity — wheel events
+     hitting the doc scroll the doc, wheel events hitting the sidebar
+     scroll the sidebar. The previous "body scrolls + sidebar overlay" mode
+     stacked both scrollbars on top of each other at the same x-coord and
+     made the sidebar appear unscrollable. */
+  html, body { height: 100vh; overflow: hidden; }
   body { padding-right: 340px; }
-  #content { max-width: 820px; margin: 0 auto; padding: 32px 24px 160px 64px; }
+  #content {
+    height: 100vh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 32px 24px 160px 64px;
+  }
 
   /* ─── Right-side document chat sidebar ───────────────────────────────── */
   /* CSS Grid (header / fill / footer) is more reliable than flex for the
@@ -51,10 +66,20 @@
     width: 340px;
     border-left: 1px solid var(--border);
     background: var(--bg);
-    display: grid;
-    grid-template-rows: auto 1fr auto;
+    /* Flex column with explicit min-height: 0 on the scroll child is the
+       canonical "scrollable middle" pattern. The earlier grid approach
+       (grid-template-rows: auto 1fr auto) kept letting the middle row grow
+       to fit content; even minmax(0, 1fr) didn't reliably bound it in
+       WKWebView. Flex with `flex: 1 1 0; min-height: 0;` on the middle is
+       the textbook fix that actually works. */
+    display: flex;
+    flex-direction: column;
     z-index: 5;
+    overscroll-behavior: contain;
   }
+  #chat-sidebar > .sidebar-head { flex: 0 0 auto; }
+  #chat-sidebar > #sidebar-threads { flex: 1 1 0; min-height: 0; }
+  #chat-sidebar > #sidebar-composer { flex: 0 0 auto; }
   .sidebar-head {
     padding: 12px 14px;
     border-bottom: 1px solid var(--border);
@@ -67,15 +92,30 @@
 
   .sidebar-scroll {
     overflow-y: auto;
+    overflow-x: hidden;
     padding: 10px;
     display: flex;
     flex-direction: column;
     gap: 10px;
-    /* Grid handles the height; min-height: 0 not needed here. */
+    min-height: 0;
+    overscroll-behavior: contain;
   }
+  /* Always-visible thin scrollbar so it's obvious that the sidebar scrolls
+     independently of the document (the macOS default hides it until you
+     interact, which is what made it look broken). */
+  .sidebar-scroll::-webkit-scrollbar { width: 10px; }
+  .sidebar-scroll::-webkit-scrollbar-track { background: transparent; }
+  .sidebar-scroll::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 5px;
+    border: 2px solid var(--bg);
+  }
+  .sidebar-scroll::-webkit-scrollbar-thumb:hover { background: var(--muted); }
   /* Sidebar thread cards are click-targets for reply-mode (composer at the
-     bottom switches to "Reply" for that thread). */
-  #sidebar-threads .thread { cursor: pointer; }
+     bottom switches to "Reply" for that thread). flex-shrink: 0 is critical
+     — without it, the flex column squashes thread cards down to a few pixels
+     each instead of letting them overflow and trigger the scrollbar. */
+  #sidebar-threads .thread { cursor: pointer; flex-shrink: 0; }
   #sidebar-threads .thread.replying {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
@@ -430,6 +470,42 @@
     color: white;
     border-color: var(--accent);
   }
+  /* Microphone (dictation) button — compact icon style, sits left of Cancel. */
+  .composer-actions button.mic {
+    padding: 2px 6px;
+    font-size: 14px;
+    line-height: 1;
+    background: transparent;
+    border: 1px solid var(--border);
+    margin-right: auto;          /* push the rest (Cancel, primary) to the right */
+  }
+  .composer-actions button.mic:hover { background: var(--hover-bg); }
+  .composer-actions button.mic.flash {
+    background: rgba(255,175,10,0.35);
+    border-color: var(--active-stripe);
+  }
+  /* Transient inline tip shown right above the composer actions when the
+     user clicks the 🎤 button. Fades out after a few seconds. */
+  .composer .dictation-tip {
+    font-size: 11.5px;
+    color: var(--fg);
+    background: rgba(255,175,10,0.15);
+    border: 1px solid rgba(255,175,10,0.45);
+    border-radius: 5px;
+    padding: 4px 8px;
+    margin: 4px 0;
+    opacity: 0;
+    transition: opacity 200ms ease;
+  }
+  .composer .dictation-tip.visible { opacity: 1; }
+  .composer .dictation-tip kbd {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    padding: 1px 4px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+  }
 
   /* Orphaned section */
   .orphan-section { margin-top: 40px; }
@@ -543,9 +619,317 @@
   @media (prefers-color-scheme: dark) {
     .mermaid-error { color: #ff6b5e; }
   }
+
+  /* ─── Code-mode (.py, .txt, .js, …) — per-line GitHub-style review ──── */
+  /* Tighter content frame: code lines look better in a narrower column. */
+  body.code-mode #content {
+    max-width: 1100px;
+    padding: 18px 14px 160px 24px;
+  }
+  /* Each line is one .block. CSS Grid: gutter (line number) | code column.
+     minmax(0, 1fr) lets the code column shrink — without the 0 floor, `1fr`
+     is implicitly `minmax(auto, 1fr)` and the column refuses to go below its
+     min-content width, which combined with `word-break: break-word` made
+     long lines wrap character-by-character into a sliver of a column. */
+  body.code-mode .block {
+    display: grid;
+    grid-template-columns: 56px minmax(0, 1fr);
+    align-items: start;
+    /* Override the markdown-mode .block padding/margin/radius/hover — code
+       lines have their own tight rhythm and a left-edge thread indicator. */
+    margin: 0;
+    padding: 0;
+    border-left: 3px solid transparent;
+    border-radius: 0;
+    background: transparent;
+  }
+  body.code-mode .block:hover { background: var(--hover-bg); }
+  body.code-mode .block.has-active { border-left-color: var(--active-stripe); }
+  body.code-mode .block.has-threads:not(.has-active) { border-left-color: var(--settled-stripe); }
+  body.code-mode .block.focused {
+    background: var(--hover-bg);
+    outline: none;
+  }
+  /* Suppress the markdown-mode .block::before (an absolute-positioned
+     hit-target hack) in code mode — we use an actual <button> for the
+     gutter instead, so the entire line number is clickable. */
+  body.code-mode .block::before { content: none; }
+  /* Line-number button = clickable gutter. Sits in column 1, occupies the
+     full track height, hover-highlights, and dispatches the same
+     `open-new` action the + button used to. Click the line number to start
+     a thread on that line — GitHub-style. */
+  body.code-mode .block .lineno {
+    grid-column: 1;
+    appearance: none;
+    background: transparent;
+    border: 0;
+    border-right: 1px solid var(--border);
+    color: var(--muted);
+    font: 500 11.5px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+    text-align: right;
+    padding: 2px 10px 2px 0;
+    user-select: none;
+    cursor: pointer;
+    width: 100%;
+    align-self: stretch;
+  }
+  body.code-mode .block .lineno:hover {
+    background: var(--hover-bg);
+    color: var(--fg);
+  }
+  body.code-mode .block .lineno::after {
+    content: "+";
+    margin-left: 6px;
+    color: var(--accent);
+    opacity: 0;
+    font-weight: 600;
+  }
+  body.code-mode .block:hover .lineno::after,
+  body.code-mode .block.focused .lineno::after { opacity: 1; }
+  body.code-mode .block-body {
+    grid-column: 2;
+    padding-left: 10px;
+    min-height: 1.5em;        /* keep blank lines visible */
+    min-width: 0;             /* allow shrink below intrinsic min-content */
+  }
+  body.code-mode .block-body pre.code-line {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    border: 0;
+    overflow: visible;
+  }
+  body.code-mode .block-body pre.code-line code {
+    font: 12.5px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
+    /* pre-wrap: respect newlines + spaces, allow soft-wrap at whitespace.
+       overflow-wrap: anywhere is the modern, well-behaved version of
+       word-break: break-word and only kicks in when a token (or
+       indentation-padded line) genuinely can't fit on one line. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    tab-size: 4;
+    -moz-tab-size: 4;
+  }
+  /* The floating + button is replaced by the clickable .lineno in the gutter.
+     Hide it entirely in code mode so the markdown-mode positioning doesn't
+     leak through. */
+  body.code-mode .block .add-btn { display: none; }
+  /* Threads sit under their anchor line, indented into the code column. */
+  body.code-mode .block .threads,
+  body.code-mode .block .composer {
+    grid-column: 2;
+  }
+
+  /* Inlined highlight.js theme — GitHub-flavored, light + dark adaptive.
+     Sourced from github.min.css and github-dark.min.css (hljs 11.10.0),
+     compacted and merged with prefers-color-scheme. */
+  pre code.hljs { display: block; overflow-x: auto; padding: 0; }
+  code.hljs     { padding: 0; background: transparent; }
+  /* Light (default) */
+  .hljs              { color: #24292e; background: transparent; }
+  .hljs-doctag,
+  .hljs-keyword,
+  .hljs-meta .hljs-keyword,
+  .hljs-template-tag,
+  .hljs-template-variable,
+  .hljs-type,
+  .hljs-variable.language_       { color: #d73a49; }
+  .hljs-title,
+  .hljs-title.class_,
+  .hljs-title.class_.inherited__,
+  .hljs-title.function_          { color: #6f42c1; }
+  .hljs-attr,
+  .hljs-attribute,
+  .hljs-literal,
+  .hljs-meta,
+  .hljs-number,
+  .hljs-operator,
+  .hljs-variable,
+  .hljs-selector-attr,
+  .hljs-selector-class,
+  .hljs-selector-id              { color: #005cc5; }
+  .hljs-regexp,
+  .hljs-string,
+  .hljs-meta .hljs-string        { color: #032f62; }
+  .hljs-built_in,
+  .hljs-symbol                   { color: #e36209; }
+  .hljs-comment,
+  .hljs-code,
+  .hljs-formula                  { color: #6a737d; }
+  .hljs-name,
+  .hljs-quote,
+  .hljs-selector-tag,
+  .hljs-selector-pseudo          { color: #22863a; }
+  .hljs-subst                    { color: #24292e; }
+  .hljs-section                  { color: #005cc5; font-weight: bold; }
+  .hljs-bullet                   { color: #735c0f; }
+  .hljs-emphasis                 { color: #24292e; font-style: italic; }
+  .hljs-strong                   { color: #24292e; font-weight: bold; }
+  .hljs-addition                 { color: #22863a; background-color: #f0fff4; }
+  .hljs-deletion                 { color: #b31d28; background-color: #ffeef0; }
+  /* Dark */
+  @media (prefers-color-scheme: dark) {
+    .hljs                { color: #c9d1d9; }
+    .hljs-doctag,
+    .hljs-keyword,
+    .hljs-meta .hljs-keyword,
+    .hljs-template-tag,
+    .hljs-template-variable,
+    .hljs-type,
+    .hljs-variable.language_       { color: #ff7b72; }
+    .hljs-title,
+    .hljs-title.class_,
+    .hljs-title.class_.inherited__,
+    .hljs-title.function_          { color: #d2a8ff; }
+    .hljs-attr,
+    .hljs-attribute,
+    .hljs-literal,
+    .hljs-meta,
+    .hljs-number,
+    .hljs-operator,
+    .hljs-variable,
+    .hljs-selector-attr,
+    .hljs-selector-class,
+    .hljs-selector-id              { color: #79c0ff; }
+    .hljs-regexp,
+    .hljs-string,
+    .hljs-meta .hljs-string        { color: #a5d6ff; }
+    .hljs-built_in,
+    .hljs-symbol                   { color: #ffa657; }
+    .hljs-comment,
+    .hljs-code,
+    .hljs-formula                  { color: #8b949e; }
+    .hljs-name,
+    .hljs-quote,
+    .hljs-selector-tag,
+    .hljs-selector-pseudo          { color: #7ee787; }
+    .hljs-subst                    { color: #c9d1d9; }
+    .hljs-section                  { color: #1f6feb; font-weight: bold; }
+    .hljs-bullet                   { color: #f2cc60; }
+    .hljs-emphasis                 { color: #c9d1d9; font-style: italic; }
+    .hljs-strong                   { color: #c9d1d9; font-weight: bold; }
+    .hljs-addition                 { color: #aff5b4; background-color: #033a16; }
+    .hljs-deletion                 { color: #ffdcd7; background-color: #67060c; }
+  }
+
+  /* ─── Floating zoom widget ──────────────────────────────────────────────
+     Bottom-left of the window, sits above content. Mirrors what ⌘+ / ⌘- /
+     ⌘0 already do via the menu; this is just a discoverable, visible
+     control. */
+  #zoom-widget {
+    position: fixed;
+    left: 14px;
+    bottom: 14px;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+    overflow: hidden;
+    opacity: 0.7;
+    transition: opacity 120ms ease;
+  }
+  #zoom-widget:hover { opacity: 1; }
+  #zoom-widget button {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    color: var(--fg);
+    font: 600 14px/1 -apple-system, system-ui, sans-serif;
+    width: 30px; height: 28px;
+    cursor: pointer;
+  }
+  #zoom-widget button:hover { background: var(--hover-bg); }
+  #zoom-widget .pct {
+    font: 600 11.5px/1 ui-monospace, "SF Mono", Menlo, monospace;
+    min-width: 44px; text-align: center;
+    color: var(--muted);
+    border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    padding: 0 6px;
+    height: 28px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;     /* click % to reset to 100% */
+    user-select: none;
+  }
+  #zoom-widget .pct:hover { color: var(--fg); }
+
+  /* ─── Search overlay ──────────────────────────────────────────────────
+     ⌘F opens a small floating search bar at the top-center. Highlights
+     every match in document text, comment bodies, anchor text, and author
+     names. Auto-expands settled threads if a match is inside. */
+  #search-bar {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+    font-size: 13px;
+  }
+  #search-bar.visible { display: flex; }
+  #search-bar input {
+    appearance: none;
+    border: 0;
+    outline: none;
+    background: transparent;
+    color: var(--fg);
+    font: inherit;
+    width: 220px;
+    padding: 4px 4px;
+  }
+  #search-bar input::placeholder { color: var(--muted); }
+  #search-bar .count {
+    font: 500 11px/1 ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--muted);
+    min-width: 48px; text-align: right;
+    padding: 0 4px;
+  }
+  #search-bar button {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    border-radius: 5px;
+    width: 24px; height: 24px;
+    cursor: pointer;
+    font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+    padding: 0;
+  }
+  #search-bar button:hover { background: var(--hover-bg); }
+  mark.search-hit {
+    background: rgba(255,224,102,0.55);
+    color: inherit;
+    padding: 0 1px;
+    border-radius: 2px;
+  }
+  mark.search-hit.current {
+    background: #ffaf0a;
+    color: #1d1d1f;
+    box-shadow: 0 0 0 2px rgba(255,175,10,0.35);
+  }
+  @media (prefers-color-scheme: dark) {
+    mark.search-hit         { background: rgba(255,200,80,0.32); color: inherit; }
+    mark.search-hit.current { background: #ffaf0a; color: #1d1d1f; }
+  }
 </style>
 <script src="marked.min.js"></script>
 <script src="mermaid.min.js"></script>
+<script src="highlight.min.js"></script>
 <script>
   // Configure marked once. `breaks: true` makes single newlines render as <br>,
   // which is what chat-style comment bodies expect. `gfm: true` enables tables,
@@ -573,6 +957,24 @@
 </script>
 </head>
 <body>
+
+<!-- Search overlay (hidden until ⌘F). Lives outside #content so it's not
+     wiped on re-renders. -->
+<div id="search-bar" role="search" aria-hidden="true">
+  <input type="text" id="search-input" placeholder="Find in this document…" autocomplete="off" spellcheck="false">
+  <span class="count" id="search-count">0/0</span>
+  <button data-action="search-prev" title="Previous match (⇧↩)">↑</button>
+  <button data-action="search-next" title="Next match (↩)">↓</button>
+  <button data-action="search-close" title="Close (Esc)">✕</button>
+</div>
+
+<!-- Floating zoom widget. Mirrors ⌘+ / ⌘- / ⌘0. -->
+<div id="zoom-widget" role="group" aria-label="Zoom controls">
+  <button data-action="zoom-out" title="Zoom out (⌘−)">−</button>
+  <span class="pct" id="zoom-pct" data-action="zoom-reset" title="Reset to 100% (⌘0)">100%</span>
+  <button data-action="zoom-in" title="Zoom in (⌘+)">+</button>
+</div>
+
 <div id="content"></div>
 
 <!-- Right-side document chat for scope=global threads. Always visible; the
@@ -583,10 +985,11 @@
     <span class="sidebar-sub" id="sidebar-summary"></span>
   </header>
   <div id="sidebar-threads" class="sidebar-scroll"></div>
-  <div id="sidebar-composer" class="composer composer-global">
+  <div id="sidebar-composer" class="composer composer-global" data-composer-key="sidebar">
     <textarea placeholder="Send a message about this document…"></textarea>
     <div class="composer-actions">
       <span class="hint">Tab / ⌘Enter to send</span>
+      <button class="mic" data-action="start-dictation" title="Dictate (Fn-Fn)" aria-label="Dictate">🎤</button>
       <button class="primary" data-action="submit-global">Send</button>
     </div>
   </div>
@@ -621,7 +1024,53 @@ const state = {
   sidebarReplyTo: null,        // root id of a global thread to reply to via the bottom composer
   pendingAttention: null,      // UUID requested by agent via `attention` — focus once, then clear
   attentionShown: new Set(),   // ids we've already focused (so we don't re-focus on every render)
+  // Composer drafts — keyed by stable composer key (e.g. `new:<line>`,
+  // `reply:<root>`, `sidebar`). Snapshotted before every render so that
+  // an external sidecar reload (agent posts a comment, someone else types)
+  // doesn't blow away the user's in-flight text or focus. Cleared on
+  // submit / cancel.
+  drafts: new Map(),           // key → { value, selStart, selEnd }
+  search: null,                // { query, index, total } when ⌘F is open
+  fileExt: '',                 // lowercase ext from Swift; '' for no extension
 };
+
+// ─── File-type routing ────────────────────────────────────────────────────
+// Markdown files (.md / .markdown / unset) use the original marked.parse +
+// mermaid pipeline, with blocks grouped by blank-line separation. Everything
+// else (.py / .txt / .js / …) flips into GitHub-style per-line code review:
+// one block per line, line-number gutter, syntax-highlighted via hljs.
+const EXT_TO_HLJS_LANG = {
+  py: 'python', pyi: 'python',
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript',
+  ts: 'typescript', tsx: 'typescript', jsx: 'javascript',
+  go: 'go', rs: 'rust', rb: 'ruby', swift: 'swift', java: 'java',
+  kt: 'kotlin', scala: 'scala', php: 'php', cs: 'csharp',
+  c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', cxx: 'cpp', hpp: 'cpp',
+  m: 'objectivec', mm: 'objectivec',
+  sh: 'bash', bash: 'bash', zsh: 'bash', fish: 'bash',
+  ps1: 'powershell',
+  sql: 'sql',
+  json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'toml',
+  ini: 'ini', conf: 'ini', cfg: 'ini',
+  xml: 'xml', html: 'xml', htm: 'xml', svg: 'xml',
+  css: 'css', scss: 'scss', less: 'less',
+  dockerfile: 'dockerfile',
+  makefile: 'makefile', mk: 'makefile',
+  lua: 'lua', r: 'r', dart: 'dart', ex: 'elixir', exs: 'elixir',
+  erl: 'erlang', clj: 'clojure', hs: 'haskell',
+  tex: 'latex', vim: 'vim', diff: 'diff', patch: 'diff',
+  // Plaintext / unknown — render monospace but skip highlighting.
+  txt: 'plaintext', log: 'plaintext', '': 'plaintext',
+};
+function isCodeMode() {
+  return state.fileExt !== '' && state.fileExt !== 'md' && state.fileExt !== 'markdown';
+}
+function hljsLangFor(ext) {
+  if (Object.prototype.hasOwnProperty.call(EXT_TO_HLJS_LANG, ext)) {
+    return EXT_TO_HLJS_LANG[ext];
+  }
+  return 'plaintext';
+}
 
 // Tracks the read state we last applied per comment id. Used to decide whether
 // a comment's ✓ → ✓✓ transition should animate (newly-read) or appear instantly
@@ -630,6 +1079,15 @@ const lastRenderedReadState = new Map();
 
 // ─── parsing source into blocks ────────────────────────────────────────────────
 function splitBlocks(src) {
+  // Code-mode (.py / .txt / .js / …): one block per line, GitHub-style.
+  // Each line is independently commentable; line numbers map 1:1 to anchorLine.
+  if (isCodeMode()) {
+    const lines = src.split('\n');
+    // Drop a single trailing empty line (the artifact of files ending in \n),
+    // but keep internal blank lines — they're real anchors in code.
+    if (lines.length && lines[lines.length - 1] === '') lines.pop();
+    return lines.map((text, i) => ({ start: i, text }));
+  }
   const lines = src.split('\n');
   const blocks = [];
   let cur = [], curStart = 0;
@@ -942,14 +1400,19 @@ function renderComment(c, idx) {
   `;
 }
 
-function renderComposer({ placeholder, primaryLabel, action, dataAttrs, hint }) {
+function renderComposer({ placeholder, primaryLabel, action, dataAttrs, hint, composerKey }) {
   const attrs = Object.entries(dataAttrs || {})
     .map(([k, v]) => `data-${k}="${escapeHtml(String(v))}"`).join(' ');
+  // No `autofocus` attribute — it re-fires on every dynamic insertion and
+  // would steal focus on every render. Focus is set explicitly in render()
+  // for newly-opened composers, and restoreComposers() restores focus for
+  // composers the user was already typing in when an external reload hit.
   return `
-    <div class="composer" ${attrs}>
-      <textarea placeholder="${escapeHtml(placeholder)}" autofocus></textarea>
+    <div class="composer" data-composer-key="${escapeHtml(composerKey)}" ${attrs}>
+      <textarea placeholder="${escapeHtml(placeholder)}"></textarea>
       <div class="composer-actions">
         <span class="hint">${escapeHtml(hint || '')}</span>
+        <button class="mic" data-action="start-dictation" title="Dictate (Fn-Fn)" aria-label="Dictate">🎤</button>
         <button data-action="cancel">Cancel</button>
         <button class="primary" data-action="${action}" ${attrs}>${escapeHtml(primaryLabel)}</button>
       </div>
@@ -993,7 +1456,8 @@ function renderThread(t, inSidebar) {
       primaryLabel: settled ? 'Reply & reopen' : 'Reply',
       action: 'submit-reply',
       dataAttrs: { root: t.root.id },
-      hint: 'Tab to submit · Esc to cancel'
+      hint: 'Tab to submit · Esc to cancel',
+      composerKey: `reply:${t.root.id}`,
     });
   }
   html += `</div>`;
@@ -1002,11 +1466,77 @@ function renderThread(t, inSidebar) {
   return html;
 }
 
+// ─── Composer draft snapshot / restore ─────────────────────────────────────
+// External sidecar reloads (agent post, GUI auto-refresh) replace the entire
+// `#content` subtree — which wipes any inline composer textarea the user is
+// typing in. To keep what they've typed AND keep focus, we snapshot every
+// composer's textarea state before re-render, then restore it from
+// state.drafts after the new DOM is in place. Drafts are keyed by a stable
+// composer key (e.g. `new:<line>`, `reply:<root>`, `sidebar`) baked into a
+// `data-composer-key` attribute by renderComposer.
+//
+// snapshotComposers() also returns the key of whichever composer textarea
+// currently owns document focus, so restoreComposers() can put focus back on
+// the same composer in the new DOM.
+function snapshotComposers() {
+  const active = document.activeElement;
+  let focusedKey = null;
+  document.querySelectorAll('.composer').forEach(c => {
+    const key = c.getAttribute('data-composer-key');
+    if (!key) return;
+    const ta = c.querySelector('textarea');
+    if (!ta) return;
+    state.drafts.set(key, {
+      value: ta.value,
+      selStart: ta.selectionStart ?? ta.value.length,
+      selEnd:   ta.selectionEnd   ?? ta.value.length,
+    });
+    if (ta === active) focusedKey = key;
+  });
+  return focusedKey;
+}
+
+function restoreComposers(focusedKey) {
+  document.querySelectorAll('.composer').forEach(c => {
+    const key = c.getAttribute('data-composer-key');
+    if (!key) return;
+    const ta = c.querySelector('textarea');
+    if (!ta) return;
+    const d = state.drafts.get(key);
+    if (d && d.value && ta.value !== d.value) {
+      // For the sidebar composer the textarea element survives renders so
+      // ta.value already matches d.value — skipping the write avoids
+      // clobbering a fresh keystroke that landed between snapshot and
+      // restore. For inline composers (just-rebuilt DOM) ta.value is empty
+      // and we restore from the draft.
+      ta.value = d.value;
+    }
+    if (d) {
+      try { ta.setSelectionRange(d.selStart, d.selEnd); } catch (_) { /* ignore */ }
+    }
+  });
+  if (focusedKey) {
+    const el = document.querySelector(`.composer[data-composer-key="${focusedKey}"] textarea`);
+    if (el) { el.focus({ preventScroll: true }); return true; }
+  }
+  return false;
+}
+
 function render() {
-  const scrollY = window.scrollY;
+  const focusedComposerKey = snapshotComposers();
   const container = document.getElementById('content');
+  // #content is now the doc scroll container (the body is locked to viewport
+  // height so the sidebar scroll region is unambiguous). Snapshot its
+  // scrollTop so re-renders don't yank the user to the top.
+  const scrollY = container ? container.scrollTop : 0;
   const frag = document.createDocumentFragment();
   const threads = buildThreads();
+
+  // Toggle a body class so code-mode CSS (line numbers, monospace, tighter
+  // grid layout, etc.) kicks in without per-block class noise.
+  document.body.classList.toggle('code-mode', isCodeMode());
+  const codeMode = isCodeMode();
+  const hljsLang = codeMode ? hljsLangFor(state.fileExt) : null;
 
   for (const b of state.blocks) {
     const div = document.createElement('div');
@@ -1018,6 +1548,7 @@ function render() {
     if (state.focusedBlock === b.start) classes.push('focused');
     div.className = classes.join(' ');
     div.setAttribute('data-line', String(b.start));
+    if (codeMode) div.setAttribute('data-line-1based', String(b.start + 1));
 
     let threadsHtml = '';
     if (blockThreads.length) {
@@ -1026,16 +1557,46 @@ function render() {
       threadsHtml += '</div>';
     }
     const newComposerHtml = state.newComposerBlock === b.start ? renderComposer({
-      placeholder: 'Start a new thread on this block…',
+      placeholder: codeMode ? `Comment on line ${b.start + 1}…` : 'Start a new thread on this block…',
       primaryLabel: 'Comment',
       action: 'submit-new',
       dataAttrs: { line: b.start, text: b.text },
-      hint: 'Tab to submit · Esc to cancel'
+      hint: 'Tab to submit · Esc to cancel',
+      composerKey: `new:${b.start}`,
     }) : '';
 
+    let bodyHtml;
+    if (codeMode) {
+      // One line per block — escape it, hand it to hljs in a synchronous pass.
+      // hljs.highlight returns a {value: 'html-with-spans'} object; we trust
+      // that output (hljs escapes everything it touches). For 'plaintext' the
+      // result is just escaped HTML with a single .hljs wrapper class.
+      let highlighted;
+      try {
+        highlighted = window.hljs
+          ? hljs.highlight(b.text || '', { language: hljsLang, ignoreIllegals: true }).value
+          : escapeHtml(b.text || '');
+      } catch (_) {
+        highlighted = escapeHtml(b.text || '');
+      }
+      // Use ​ (zero-width space) on truly empty lines so the .block-body
+      // grid cell still occupies a row instead of collapsing to 0 height.
+      if (!highlighted) highlighted = '​';
+      bodyHtml = `<pre class="code-line"><code class="hljs language-${hljsLang}">${highlighted}</code></pre>`;
+    } else {
+      bodyHtml = marked.parse(b.text);
+    }
+
+    // In code mode the clickable gutter (line number) IS the "new thread"
+     // affordance; suppress the absolutely-positioned + button (CSS hides it
+     // too, but skipping the markup keeps the DOM cleaner and avoids it
+     // ever being a tab stop / a11y target).
+    const linenoOrPlus = codeMode
+      ? `<button class="lineno" data-action="open-new" data-line="${b.start}" data-text="${escapeHtml(b.text)}" title="Comment on line ${b.start + 1}">${b.start + 1}</button>`
+      : `<button class="add-btn" data-action="open-new" data-line="${b.start}" data-text="${escapeHtml(b.text)}" title="New thread">+</button>`;
     div.innerHTML = `
-      <button class="add-btn" data-action="open-new" data-line="${b.start}" data-text="${escapeHtml(b.text)}" title="New thread">+</button>
-      <div class="block-body">${marked.parse(b.text)}</div>
+      ${linenoOrPlus}
+      <div class="block-body">${bodyHtml}</div>
       ${threadsHtml}
       ${newComposerHtml}
     `;
@@ -1056,7 +1617,7 @@ function render() {
   }
 
   container.replaceChildren(frag);
-  if (window.scrollY !== scrollY) window.scrollTo(0, scrollY);
+  if (container.scrollTop !== scrollY) container.scrollTop = scrollY;
 
   // ── Render the global-chat sidebar ──────────────────────────────────────
   renderSidebar(threads);
@@ -1094,7 +1655,14 @@ function render() {
     lastRenderedReadState.set(c.id, (c.readBy || []).length > 0);
   }
 
-  // Auto-focus ONLY a composer the user explicitly opened.
+  // Restore composer drafts (value + selection) and put focus back on
+  // whichever composer the user was typing in before the re-render.
+  // Returns true if focus was restored, in which case the explicit-open
+  // fallback below should NOT run.
+  const focusRestored = restoreComposers(focusedComposerKey);
+
+  // Auto-focus ONLY a composer the user explicitly just opened, and only
+  // if restoreComposers didn't already park focus somewhere.
   //
   // Active threads always render a reply composer at the bottom (it's a
   // standing affordance). If we auto-focused any composer we found, that
@@ -1105,13 +1673,15 @@ function render() {
   //   - newComposerBlock set ⇒ a "new thread" composer is the active one
   //   - replyComposerRoot set ⇒ a reply composer (e.g. for a settled thread
   //     the user is reopening) is the active one
-  let toFocus = null;
-  if (state.newComposerBlock !== null) {
-    toFocus = document.querySelector(`.composer[data-composer-line="${state.newComposerBlock}"] textarea`);
-  } else if (state.replyComposerRoot !== null) {
-    toFocus = document.querySelector(`.thread[data-root="${state.replyComposerRoot}"] .composer textarea`);
+  if (!focusRestored) {
+    let toFocus = null;
+    if (state.newComposerBlock !== null) {
+      toFocus = document.querySelector(`.composer[data-composer-key="new:${state.newComposerBlock}"] textarea`);
+    } else if (state.replyComposerRoot !== null) {
+      toFocus = document.querySelector(`.composer[data-composer-key="reply:${state.replyComposerRoot}"] textarea`);
+    }
+    if (toFocus) toFocus.focus({ preventScroll: true });
   }
-  if (toFocus) toFocus.focus({ preventScroll: true });
 }
 
 // ─── navigation between blocks ─────────────────────────────────────────────────
@@ -1246,6 +1816,9 @@ document.addEventListener('click', (e) => {
     return;
   }
   if (action === 'cancel') {
+    const composer = t.closest('.composer');
+    const key = composer && composer.getAttribute('data-composer-key');
+    if (key) state.drafts.delete(key);
     state.newComposerBlock = null;
     state.replyComposerRoot = null;
     render();
@@ -1258,6 +1831,7 @@ document.addEventListener('click', (e) => {
     const line = parseInt(t.getAttribute('data-line'), 10);
     const text = t.getAttribute('data-text') || '';
     postSwift({ type: 'addComment', line, text, body });
+    state.drafts.delete(`new:${line}`);
     state.newComposerBlock = null;
     // Keep focus on the same block. Auto-advancing here used to make a
     // subsequent Enter open a composer on the next (unrelated) block.
@@ -1269,6 +1843,7 @@ document.addEventListener('click', (e) => {
     if (!body) return;
     const root = t.getAttribute('data-root');
     postSwift({ type: 'addComment', replyTo: root, body });
+    state.drafts.delete(`reply:${root}`);
     state.replyComposerRoot = null;
     return;
   }
@@ -1320,6 +1895,9 @@ document.addEventListener('keydown', (e) => {
       return;
     }
     if (e.key === 'Escape') {
+      const composer = e.target.closest('.composer');
+      const key = composer && composer.getAttribute('data-composer-key');
+      if (key) state.drafts.delete(key);
       state.newComposerBlock = null;
       state.replyComposerRoot = null;
       e.target.blur();
@@ -1507,6 +2085,28 @@ document.addEventListener('click', (e) => {
     }
     hideOverlay(); return;
   }
+  if (action === 'zoom-in')    { postSwift({ type: 'zoomIn' });    return; }
+  if (action === 'zoom-out')   { postSwift({ type: 'zoomOut' });   return; }
+  if (action === 'zoom-reset') { postSwift({ type: 'zoomReset' }); return; }
+  if (action === 'search-prev')  { searchStep(-1); return; }
+  if (action === 'search-next')  { searchStep(1);  return; }
+  if (action === 'search-close') { closeSearch();  return; }
+  if (action === 'start-dictation') {
+    // WKWebView's textareas don't implement the `startDictation:` selector
+    // (only NSText/NSTextView do — that's why TextEdit's menu works and ours
+    // beeped). The only reliable trigger inside a WKWebView is the system
+    // shortcut (Fn-Fn by default, configurable in System Settings ▸ Keyboard
+    // ▸ Dictation), which is app-agnostic and routes spoken text to the
+    // focused DOM element automatically.
+    //
+    // So the 🎤 button just focuses the textarea and flashes a tip telling
+    // the user to press Fn-Fn. macOS handles everything from there.
+    const composer = t.closest('.composer');
+    const ta = composer && composer.querySelector('textarea');
+    if (ta) ta.focus({ preventScroll: true });
+    flashDictationTip(composer);
+    return;
+  }
   if (action === 'submit-global') {
     const composer = t.closest('.composer');
     const ta = composer.querySelector('textarea');
@@ -1520,6 +2120,7 @@ document.addEventListener('click', (e) => {
       postSwift({ type: 'addGlobal', body });
     }
     ta.value = '';
+    state.drafts.delete('sidebar');
     render();
     return;
   }
@@ -1568,11 +2169,238 @@ function focusComment(id) {
   }
 }
 
+// ─── Dictation tip flash ───────────────────────────────────────────────────
+// The 🎤 button can't actually trigger macOS dictation directly (the
+// `startDictation:` selector isn't implemented by WKWebView's internal text
+// inputs — only NSText/NSTextView). The Fn-Fn system shortcut is the only
+// path that works inside a WKWebView, so the button's job is to point the
+// user at it.
+function flashDictationTip(composer) {
+  if (!composer) return;
+  const mic = composer.querySelector('button.mic');
+  if (mic) {
+    mic.classList.add('flash');
+    setTimeout(() => mic.classList.remove('flash'), 800);
+  }
+  let tip = composer.querySelector('.dictation-tip');
+  if (!tip) {
+    tip = document.createElement('div');
+    tip.className = 'dictation-tip';
+    tip.innerHTML = 'Press <kbd>Fn</kbd> <kbd>Fn</kbd> to start dictating — macOS handles the rest. ' +
+                    '(Configure the shortcut in System Settings ▸ Keyboard ▸ Dictation.)';
+    const actions = composer.querySelector('.composer-actions');
+    if (actions) composer.insertBefore(tip, actions);
+    else composer.appendChild(tip);
+  }
+  requestAnimationFrame(() => tip.classList.add('visible'));
+  clearTimeout(tip._fadeTimer);
+  tip._fadeTimer = setTimeout(() => {
+    tip.classList.remove('visible');
+    setTimeout(() => { if (tip.parentNode) tip.parentNode.removeChild(tip); }, 250);
+  }, 4500);
+}
+
+// ─── In-document search (⌘F) ───────────────────────────────────────────────
+// Walks every text node inside the search "roots" (main content, sidebar
+// threads, orphan section, and threaded comment metadata like authors/
+// anchor text) and wraps matches in <mark class="search-hit">. The currently-
+// selected match additionally gets .current and is scrolled into view.
+//
+// Settled threads that are collapsed are auto-expanded before searching so
+// matches inside them are visible. Composer textareas are intentionally
+// skipped — interfering with the user's in-flight typing would be worse
+// than missing a match in a draft.
+const SEARCH_ROOT_SELECTOR = '#content, #sidebar-threads';
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function clearSearchHighlights() {
+  document.querySelectorAll('mark.search-hit').forEach(m => {
+    const parent = m.parentNode;
+    if (!parent) return;
+    while (m.firstChild) parent.insertBefore(m.firstChild, m);
+    parent.removeChild(m);
+    parent.normalize();
+  });
+}
+
+function highlightTextNodes(root, re) {
+  // Collect candidate text nodes first (mutating during the walk corrupts the iterator).
+  const NodeFilter_ = NodeFilter;
+  const walker = document.createTreeWalker(root, NodeFilter_.SHOW_TEXT, {
+    acceptNode(n) {
+      // Skip empty / whitespace-only text.
+      if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter_.FILTER_REJECT;
+      // Skip anything inside a composer textarea or our own search highlights.
+      const p = n.parentNode;
+      if (!p) return NodeFilter_.FILTER_REJECT;
+      if (p.closest && (p.closest('.composer') || p.closest('mark.search-hit') || p.closest('script') || p.closest('style'))) {
+        return NodeFilter_.FILTER_REJECT;
+      }
+      return NodeFilter_.FILTER_ACCEPT;
+    }
+  });
+  const nodes = [];
+  let n;
+  while ((n = walker.nextNode())) nodes.push(n);
+
+  const hits = [];
+  for (const tn of nodes) {
+    const text = tn.nodeValue;
+    re.lastIndex = 0;
+    let m, last = 0;
+    const frag = document.createDocumentFragment();
+    let matched = false;
+    while ((m = re.exec(text)) !== null) {
+      matched = true;
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const mark = document.createElement('mark');
+      mark.className = 'search-hit';
+      mark.textContent = m[0];
+      frag.appendChild(mark);
+      hits.push(mark);
+      last = m.index + m[0].length;
+      if (m.index === re.lastIndex) re.lastIndex++;  // zero-width safety
+    }
+    if (matched) {
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      tn.parentNode.replaceChild(frag, tn);
+    }
+  }
+  return hits;
+}
+
+function runSearch(query, preserveIndex) {
+  clearSearchHighlights();
+  const trimmed = (query || '').trim();
+  const countEl = document.getElementById('search-count');
+  if (!trimmed) {
+    state.search = { query: '', index: 0, total: 0, hits: [] };
+    if (countEl) countEl.textContent = '0/0';
+    return;
+  }
+  // Auto-expand every settled thread so collapsed matches become visible.
+  let expandedAny = false;
+  document.querySelectorAll('.thread.settled.collapsed').forEach(t => {
+    const root = t.getAttribute('data-root');
+    if (root && !state.expandedSettled.has(root)) {
+      state.expandedSettled.add(root);
+      expandedAny = true;
+    }
+  });
+  if (expandedAny) {
+    // Re-render to drop the .collapsed class. After render, we'll re-enter
+    // runSearch from applyState/the caller's second pass — but to avoid
+    // recursion we just inline the re-render here and continue.
+    render();
+  }
+
+  const re = new RegExp(escapeRegExp(trimmed), 'gi');
+  const hits = [];
+  document.querySelectorAll(SEARCH_ROOT_SELECTOR).forEach(root => {
+    hits.push(...highlightTextNodes(root, re));
+  });
+
+  let index = 0;
+  if (preserveIndex && state.search && state.search.total > 0 && hits.length > 0) {
+    index = Math.min(state.search.index, hits.length - 1);
+  }
+  state.search = { query: trimmed, index, total: hits.length, hits };
+  if (countEl) countEl.textContent = hits.length ? `${index + 1}/${hits.length}` : `0/0`;
+  applyCurrentSearchHit({ scroll: !preserveIndex });
+}
+
+function applyCurrentSearchHit({ scroll }) {
+  if (!state.search || !state.search.hits.length) return;
+  // Hits in the DOM may have been replaced if applyState re-ran runSearch —
+  // grab fresh references just in case.
+  const live = Array.from(document.querySelectorAll('mark.search-hit'));
+  if (!live.length) return;
+  live.forEach(el => el.classList.remove('current'));
+  const i = Math.max(0, Math.min(state.search.index, live.length - 1));
+  const cur = live[i];
+  cur.classList.add('current');
+  if (scroll) cur.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function searchStep(delta) {
+  if (!state.search || !state.search.total) return;
+  state.search.index = (state.search.index + delta + state.search.total) % state.search.total;
+  const countEl = document.getElementById('search-count');
+  if (countEl) countEl.textContent = `${state.search.index + 1}/${state.search.total}`;
+  applyCurrentSearchHit({ scroll: true });
+}
+
+function openSearch() {
+  const bar = document.getElementById('search-bar');
+  const input = document.getElementById('search-input');
+  if (!bar || !input) return;
+  bar.classList.add('visible');
+  bar.setAttribute('aria-hidden', 'false');
+  // Pre-select any existing query so the user can type to replace.
+  input.focus();
+  input.select();
+}
+
+function closeSearch() {
+  const bar = document.getElementById('search-bar');
+  if (bar) {
+    bar.classList.remove('visible');
+    bar.setAttribute('aria-hidden', 'true');
+  }
+  clearSearchHighlights();
+  state.search = null;
+  const countEl = document.getElementById('search-count');
+  if (countEl) countEl.textContent = '0/0';
+}
+
+// Search-bar input + keyboard wiring.
+document.addEventListener('input', (e) => {
+  if (e.target && e.target.id === 'search-input') {
+    runSearch(e.target.value, /*preserveIndex=*/false);
+  }
+});
+document.addEventListener('keydown', (e) => {
+  // ⌘F (or Ctrl+F) anywhere → open the search bar.
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'f' || e.key === 'F')) {
+    openSearch();
+    e.preventDefault();
+    return;
+  }
+  // Within the search input: Enter / Shift+Enter step, Esc closes.
+  if (e.target && e.target.id === 'search-input') {
+    if (e.key === 'Enter') {
+      searchStep(e.shiftKey ? -1 : 1);
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'Escape') {
+      closeSearch();
+      e.preventDefault();
+      return;
+    }
+  }
+}, true);  // capture phase so we beat the composer-textarea Escape handler.
+
 window.hr = {
   applyState(payload) {
+    // fileExt must be set BEFORE splitBlocks — splitBlocks branches on isCodeMode().
+    state.fileExt = (payload.fileExt || '').toLowerCase();
     state.blocks = splitBlocks(payload.source || '');
     state.comments = payload.comments || [];
+    // Update the floating zoom indicator. Swift owns the authoritative value.
+    if (typeof payload.pageZoom === 'number') {
+      const el = document.getElementById('zoom-pct');
+      if (el) el.textContent = Math.round(payload.pageZoom * 100) + '%';
+    }
     render();
+    // Re-apply current search (if any) to the freshly rendered DOM so the
+    // user's match list and current-index survive external reloads.
+    if (state.search && state.search.query) {
+      runSearch(state.search.query, /*preserveIndex=*/true);
+    }
     // Attention: an agent has explicitly requested the user's focus on a
     // specific comment via `human-review attention …`. Honor it once, then
     // tell Swift to clear the sidecar flag so we don't keep refocusing.

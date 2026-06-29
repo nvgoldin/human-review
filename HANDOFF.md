@@ -12,7 +12,7 @@ human-review file.md         # GUI mode
 human-review watch file.md   # live JSONL on stdout, auto-acks every event seen
 ```
 
-The repo is **local-only** (`git remote -v` is empty). **Never push to a remote without explicit user permission.** The binary at `~/bin/human-review` is a symlink into `.build/release/`, so `./install.sh` is the way to ship a change.
+The repo is **local-only** (`git remote -v` is empty). **Never push to a remote without explicit user permission.** `./install.sh` builds a release binary, assembles a `.app` bundle at `~/Applications/human-review.app`, ad-hoc-signs it with a stable identifier, and points `~/bin/human-review` at the in-bundle executable. Always re-run `./install.sh` to ship a change.
 
 ## Repo layout
 
@@ -21,14 +21,31 @@ The repo is **local-only** (`git remote -v` is empty). **Never push to a remote 
 ├── Package.swift                                — SwiftPM, single executable target
 ├── README.md                                    — user-facing docs (shell-first)
 ├── HANDOFF.md                                   — this file
-├── install.sh                                   — swift build -c release + symlink to ~/bin
+├── install.sh                                   — build + .app bundle + ad-hoc codesign + ~/bin symlink
+├── bundle/
+│   └── Info.plist                               — template baked into the .app on every install
 ├── Sources/human-review/
-│   ├── main.swift                               — ~1900 lines: model, store, session, CLI, stdin protocol, AppDelegate
+│   ├── main.swift                               — ~2200 lines: model, store, session, CLI, stdin protocol, AppDelegate
 │   └── Resources/
-│       ├── viewer.html                          — ~1500 lines: HTML/CSS + render JS + bridge
+│       ├── viewer.html                          — ~2000 lines: HTML/CSS + render JS + bridge
 │       ├── marked.min.js                        — bundled (40KB) markdown → HTML
 │       └── mermaid.min.js                       — bundled (3.2MB) mermaid diagram rendering
-└── .build/release/human-review                  — the symlink target
+└── .build/release/human-review                  — raw build product, copied into the .app by install.sh
+```
+
+The shipped .app lives outside the repo:
+
+```
+~/Applications/human-review.app/
+└── Contents/
+    ├── Info.plist                               — CFBundleIdentifier dev.nadav.human-review,
+    │                                              NSMicrophoneUsageDescription, NSSpeechRecognitionUsageDescription
+    ├── MacOS/human-review                       — the executable
+    └── Resources/
+        └── human-review_human-review.bundle/    — SwiftPM resources (viewer.html etc.)
+                                                  AppResources helper in main.swift prefers this path;
+                                                  Bundle.module's default would land them at .app root,
+                                                  which codesign rejects ("unsealed contents at bundle root").
 ```
 
 ## Per-file artifacts (the agent's universe)
@@ -100,7 +117,27 @@ Implementation: `pendingAttention: UUID?` field on `CommentFile` (the sidecar). 
 
 **Mermaid + diagram zoom overlay.** ```` ```mermaid ```` fenced blocks render as SVG via `mermaid.run({nodes})` (NOT `mermaid.render(id, src)` — that had a race condition where async work clobbered the DOM during the GUI's auto-reload). Clicking a diagram opens an overlay with a toolbar (−/＋/Fit/100%, current % live), 20%-2000% zoom range, drag-to-pan, wheel/pinch zoom, double-click to reset.
 
-**Whole-window zoom.** `⌘+ / ⌘- / ⌘0` + trackpad pinch — `WKWebView.pageZoom` on `ReviewSession.pageZoom`, persists across file navigation.
+**Sidebar scroll (load-bearing — easy to break).** Three things together make the right-side `Document chat` sidebar scroll independently of the document; removing any one of them silently re-breaks it:
+
+1. `html, body { height: 100vh; overflow: hidden }`. The doc scroll lives inside `#content` (`height: 100vh; overflow-y: auto`) — NOT on `body`. If the body scrolls, *both* scrollbars stack at the right edge of the viewport (same x-coord as the sidebar's), and the body's wins all wheel events. The two `window.scrollY` calls in `render()` read/write `container.scrollTop` because of this.
+2. `#chat-sidebar` is `display: flex; flex-direction: column`, with `#sidebar-threads { flex: 1 1 0; min-height: 0 }`. `min-height: 0` is required — flex items default to `min-height: auto` and refuse to shrink below their content size, so without it the threads region grows to fit and never overflows. Earlier attempts using `display: grid; grid-template-rows: auto minmax(0, 1fr) auto` worked on paper but WKWebView didn't actually bound the middle track. Flex with explicit `min-height: 0` is the textbook fix and it sticks.
+3. `#sidebar-threads .thread { flex-shrink: 0 }`. `.sidebar-scroll` is itself `display: flex; flex-direction: column` (so threads stack with a `gap`). Without `flex-shrink: 0` on each card, the flex algorithm proportionally squashes all N threads to fit the container instead of letting them overflow — so the threads render as 5-px-tall bars, no scrollbar appears, and it looks completely broken.
+
+The sidebar scrollbar is also styled to be always-visible (`::-webkit-scrollbar` rules) so it's obvious which region scrolls.
+
+**Whole-window zoom.** `⌘+ / ⌘- / ⌘0` + trackpad pinch — `WKWebView.pageZoom` on `ReviewSession.pageZoom`, persists across file navigation. `⌘+` requires explicit `[.command, .shift]` modifier mask on the menu item (the keyEquivalent `"+"` is `Shift+=` on US layouts and won't fire without it). There's also a hidden `⌘=` alternate for users who don't realize Shift is required. A floating `−` / `%` / `+` widget at the bottom-left of the window mirrors the menu actions and shows the current percentage. The widget's button clicks send `zoomIn` / `zoomOut` / `zoomReset` messages via the JS bridge; the handler writes `webView.pageZoom` directly (Swift's `@ObservedObject session` chain isn't reliable enough to trigger `updateNSView` when only `pageZoom` mutates in place) and pushes a fresh `applyState` so the % indicator updates immediately.
+
+**In-document search (`⌘F`).** Floating bar at top-center: input + `1/N` count + ↑ / ↓ / ✕. Walks text nodes inside `#content` and `#sidebar-threads`, wraps matches in `<mark class="search-hit">` (current match also gets `.current`). Auto-expands settled/collapsed threads when a match is inside. Skips composer textareas so a live search doesn't corrupt drafts. `Enter` / `Shift+Enter` step, `Esc` closes. Survives external sidecar reloads — `applyState` re-runs the active query and preserves the current index. The composer-draft system (see below) and search both rely on stable `data-composer-key` / `mark.search-hit` selectors — don't rename without updating both code paths.
+
+**Composer drafts.** Every composer (new-thread / reply / sidebar) gets a stable `data-composer-key` (`new:<line>`, `reply:<root>`, `sidebar`). `snapshotComposers()` runs at the top of `render()` and captures `{value, selStart, selEnd}` + which composer had focus; `restoreComposers()` writes them back after `replaceChildren()`. Drafts cleared on submit-new / submit-reply / submit-global / cancel / Esc. Without this, an external sidecar reload (agent posts a comment while you're typing) would wipe the textarea and steal focus. `autofocus` is intentionally NOT on composer textareas — it re-fires on every re-insertion and competes with the snapshot/restore flow.
+
+**Dictation.** macOS system dictation (Fn-Fn, the Edit ▸ Start Dictation… menu item, or the 🎤 button in any composer) inserts speech-to-text into the focused composer textarea. Three requirements made this work:
+
+  1. The app must be a real `.app` bundle with a stable `CFBundleIdentifier` — TCC (microphone, speech recognition) refuses to attribute permissions to a raw SwiftPM executable launched from the terminal. `install.sh` handles this.
+  2. `Info.plist` must include `NSMicrophoneUsageDescription` and `NSSpeechRecognitionUsageDescription` — without them, macOS exits silently when dictation tries to start. They live in `bundle/Info.plist`.
+  3. The `.app` must be ad-hoc-signed with a stable identifier (`codesign --sign - --identifier dev.nadav.human-review --force`). Without `--identifier`, every rebuild changes the signature hash and TCC sometimes re-prompts; with it, the grant sticks. `--deep` is intentionally omitted — codesign tries to recursively sign the SwiftPM resource `.bundle/` (which has no Mach-O / Info.plist) and fails with "bundle format unrecognized."
+
+  The JS side just calls `postSwift({type: 'startDictation'})`; the Swift handler dispatches `Selector(("startDictation:"))` to `nil` so it walks the responder chain and lands on the focused WKWebView textarea. The Edit menu item uses the same selector with an empty `keyEquivalent` — macOS auto-renders the user's configured Fn-Fn shortcut from System Settings.
 
 **`writeInlineExport` invariant.** The `.review.md` rebuild only inlines `scope == .block` comments whose `anchorLine` is in `[0, lines.count)`. Globals + orphans + stale-anchor blocks render in a separate "Document discussion" section at the bottom of `.review.md`. Earlier `start..<lines.count` traps on a stale anchor were fixed by guarding `start` and using a closed range bounded by `lastValidLine` (commit `ac16def`).
 
