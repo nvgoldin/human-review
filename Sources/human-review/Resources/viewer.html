@@ -1185,6 +1185,22 @@ function wrapMermaidBlocks(root) {
   });
 }
 
+// ─── hljs post-processor for markdown fenced code blocks ────────────────
+// marked emits ```lang fenced blocks as <pre><code class="language-lang">.
+// This walks each one and runs hljs.highlightElement, matching the styling
+// we already use in whole-file code mode. Skips .language-mermaid (that's
+// the mermaid post-processor's job) and anything already highlighted (hljs
+// marks nodes with a `data-highlighted` attribute — idempotent, so calling
+// it twice after auto-reload is safe).
+function highlightMarkdownCodeIn(root) {
+  if (!root || !window.hljs) return;
+  root.querySelectorAll('pre > code[class*="language-"]').forEach(el => {
+    if (el.classList.contains('language-mermaid')) return;
+    if (el.dataset.highlighted === 'yes') return;
+    try { hljs.highlightElement(el); } catch (_) { /* leave un-highlighted */ }
+  });
+}
+
 // Click-to-zoom overlay for diagrams. Reuses the cross-link overlay container
 // with a toolbar (zoom in/out/reset, %), drag-to-pan, and wheel/pinch zoom.
 function openDiagramOverlay(block) {
@@ -1627,6 +1643,11 @@ function render() {
   // doesn't depend on diagrams being painted.
   renderMermaidIn(document.getElementById('content'));
   renderMermaidIn(document.getElementById('sidebar-threads'));
+  // Syntax-highlight ```lang fenced blocks in markdown content + comment
+  // bodies (sidebar threads + inline replies). Idempotent — hljs marks each
+  // element with data-highlighted so repeat calls after auto-reload no-op.
+  highlightMarkdownCodeIn(document.getElementById('content'));
+  highlightMarkdownCodeIn(document.getElementById('sidebar-threads'));
 
   // ── Read-receipt state promotion ─────────────────────────────────────────
   // Comments already known-read at the last render get .read added BEFORE
@@ -2037,8 +2058,10 @@ function showOverlay(payload) {
   ov.classList.add('visible');
   ov.setAttribute('aria-hidden', 'false');
   document.getElementById('overlay-body').scrollTop = 0;
-  // Render mermaid diagrams inside the linked-document overlay too.
+  // Render mermaid diagrams + hljs-highlight fenced code inside the
+  // linked-document overlay too.
   renderMermaidIn(document.getElementById('overlay-body'));
+  highlightMarkdownCodeIn(document.getElementById('overlay-body'));
 }
 
 function showOverlayError(payload) {
