@@ -6,8 +6,11 @@
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>human-review</string>
+    <!-- CFBundleIdentifier is rewritten at install time by install.sh so it
+         matches whatever BUNDLE_ID the user picked (or the default). Keep
+         the placeholder here mainly for humans skimming the file. -->
     <key>CFBundleIdentifier</key>
-    <string>dev.nadav.human-review</string>
+    <string>io.github.nvgoldin.human-review</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

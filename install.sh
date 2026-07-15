@@ -32,7 +32,12 @@ cd "$(dirname "$0")"
 
 REPO_ROOT="$(pwd -P)"
 APP_NAME="human-review"
-BUNDLE_ID="dev.nadav.human-review"
+# Bundle identifier. macOS TCC keys mic/dictation permission per-identifier,
+# so keep this stable across rebuilds (any change forces a fresh permission
+# prompt). Override with `BUNDLE_ID=your.identifier.human-review ./install.sh`
+# if the default clashes with an existing app on your Mac. The default uses
+# a reverse-GitHub URL form since this project doesn't own a real domain.
+BUNDLE_ID="${BUNDLE_ID:-io.github.nvgoldin.human-review}"
 APP_DIR="${HOME}/Applications/${APP_NAME}.app"
 CONTENTS="${APP_DIR}/Contents"
 APP_MACOS="${CONTENTS}/MacOS"
@@ -75,7 +80,10 @@ if [[ -d "$RES_BUNDLE_SRC" ]]; then
 fi
 
 # Info.plist — refreshed every build so template changes propagate.
+# Substitute CFBundleIdentifier with the resolved $BUNDLE_ID (which may have
+# come from the env override) so the plist and codesign identifier agree.
 cp -f "$INFO_SRC" "${CONTENTS}/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${BUNDLE_ID}" "${CONTENTS}/Info.plist"
 
 # Ad-hoc sign with a stable identifier. Without --identifier, every rebuild
 # changes the signature hash and TCC sometimes re-prompts for mic/dictation;
