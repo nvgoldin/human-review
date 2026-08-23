@@ -1,0 +1,84 @@
+install.sh
+  s_8ab798f9609005::t_e55e29f14dffcb 87-90
+  s_8ab798f9609005::t_e584ce492434bd 53
+  s_8ab798f9609005::t_4b4362a825cc3b 132-146
+  s_8ab798f9609005::t_f207ba69d5777b 63-66
+run-tests.sh
+  s_8ab798f9609005::t_b2e6c2a619cadb 1-61
+README.md
+  s_8ab798f9609005::t_ff3b81ee71b908 305
+  s_8ab798f9609005::t_6a7310db368ebd 317-319,321-329
+  s_8ab798f9609005::t_2f2bed9d06b20e 1-4,23-25,29-30,44-48,186-265,308,315-316,320,330-342,353-355
+  s_8ab798f9609005::t_8eff384ecc1e28 84-90
+HANDOFF.md
+  s_8ab798f9609005::t_5896cd52d85f7e 24-29,31-34
+  s_8ab798f9609005::t_fbe33d83d6b680 15
+  s_8ab798f9609005::t_08f78204734158 154-163,165-173
+  s_8ab798f9609005::t_2b63f896a11146 3,35,38,175-178,220-222,229-239
+icon/build-icon.sh
+  s_8ab798f9609005::t_59f8b78dae257a 1-78
+bundle/Info.plist
+  s_8ab798f9609005::t_1ce1e3f4ea4043 9-10
+Package.swift
+  s_8ab798f9609005::t_21da8d86f44a2b 13-16
+Sources/human-review/main.swift
+  s_8ab798f9609005::t_2407fdd713e2e1 1482-1524
+  s_8ab798f9609005::t_6aee59d4fa3278 1363
+  s_8ab798f9609005::t_2182caef4761fc 1325-1326,1330,1335-1336
+  s_8ab798f9609005::t_cf8907ca3a7285 2127-2129
+  s_8ab798f9609005::t_d7aa26f7127f6d 2007
+Tests/HumanReviewTests/CommentLifecycleTests.swift
+  s_8ab798f9609005::t_4fc03f15e6d0d0 1-238,242,254-498
+  s_8ab798f9609005::t_87bfaad99cfa04 239-241,243-253
+Tests/HumanReviewTests/ReviewCLIFixture.swift
+  s_8ab798f9609005::t_bdb6bfc52f2cea 1-267
+Tests/HumanReviewTests/ConfigAndBannerTests.swift
+  s_8ab798f9609005::t_a1452ecac999b1 1-351
+  s_8ab798f9609005::t_52b0ce3d94257d 352-361
+skills/human-review/SKILL.md
+  s_8ab798f9609005::t_c6bd493ee2ba27 19-22
+  s_8ab798f9609005::t_5efc2f57b3b261 241-247
+  s_8ab798f9609005::t_49f074708193aa 16-18
+  s_8ab798f9609005::t_5a85d4eba61214 23-25,238-240
+  s_8ab798f9609005::t_f836b5e249baef 248-250
+  s_8ab798f9609005::t_c11b5e4e973f07 1-15,26-237,251-265
+Sources/human-review/Config.swift
+  s_8ab798f9609005::t_2bea322610d522 375-382
+  s_8ab798f9609005::t_de89c015449bf4 38,40-44,53-54
+  s_8ab798f9609005::t_3bb58ddf6c3e4c 392,394-396
+  s_8ab798f9609005::t_d956a886a25a10 1-37,39,45-52,55-143,145-182,184-301,303-374,384-391,393,397-408,411-417,419-423,426-427,429-434,436-443,445-462,464-467,469-523
+  s_8ab798f9609005::t_9f9b8f2e378eb7 183
+  s_8ab798f9609005::t_a13210f9bd02e1 302
+  s_8ab798f9609005::t_250e899ee339e3 144
+  s_8ab798f9609005::t_b2a0a56e1f3d51 383
+  s_8ab798f9609005::t_d7489a8e2e9550 409-410
+  s_8ab798f9609005::t_2728f127a7851a 418
+  s_8ab798f9609005::t_7858cd3c1313c1 424-425
+  s_8ab798f9609005::t_dcbe9cb7088668 428
+  s_8ab798f9609005::t_276dc94084ab32 435
+  s_8ab798f9609005::t_a8423f59595dca 444
+  s_8ab798f9609005::t_2f54f819810eb8 463
+  s_8ab798f9609005::t_427317280c15c0 468
+.githooks/pre-commit
+  s_8ab798f9609005::t_ad37e233ca250e 1-14
+.gitleaks.toml
+  s_8ab798f9609005::t_274f441f3400b2 1-13
+icon/human-review.svg
+  s_8ab798f9609005::t_3370b78d417fee 1-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "260ed18b9768710d2e0d3ff39424cebb6fc12889",
+  "prompts": {},
+  "sessions": {
+    "s_8ab798f9609005": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f96a16a4-2656-434b-b3f0-5ad897f3d39e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "ngoldin@virtual-gate.net <ngoldin@virtual-gate.net>"
+    }
+  }
+}
