@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Block a commit that stages a secret. Wired by `install.sh`, which sets
+# core.hooksPath to this directory when it runs inside the checkout.
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks is not installed — install it or the secret scan cannot run." >&2
+  echo "            brew install gitleaks" >&2
+  exit 1
+fi
+
+echo "pre-commit: scanning staged changes with gitleaks..."
+gitleaks git --staged --redact --no-banner --config .gitleaks.toml
+echo "pre-commit: clean."

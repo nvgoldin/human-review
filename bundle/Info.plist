@@ -6,6 +6,8 @@
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>human-review</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <!-- CFBundleIdentifier is rewritten at install time by install.sh so it
          matches whatever BUNDLE_ID the user picked (or the default). Keep
          the placeholder here mainly for humans skimming the file. -->

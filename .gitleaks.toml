@@ -1,0 +1,13 @@
+# Gitleaks configuration for human-review. Extends the upstream default rule
+# set and allowlists the vendored minified bundles, whose entropy trips the
+# generic high-entropy rules on every commit that touches them.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Vendored browser libraries shipped as app resources"
+paths = [
+  '''Sources/human-review/Resources/marked\.min\.js''',
+  '''Sources/human-review/Resources/highlight\.min\.js''',
+  '''Sources/human-review/Resources/mermaid\.min\.js''',
+]

@@ -10,6 +10,10 @@ let package = Package(
             resources: [
                 .process("Resources")
             ]
+        ),
+        .testTarget(
+            name: "HumanReviewTests",
+            path: "Tests/HumanReviewTests"
         )
     ]
 )

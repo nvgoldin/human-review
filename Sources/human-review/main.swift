@@ -1322,14 +1322,18 @@ enum CLI {
         let args = Array(argv.dropFirst())
         guard !args.isEmpty else { printUsage(); return 2 }
 
+        Preferences.writeBannerToStandardError(args)
+
         let subcommands: Set<String> = [
             "add", "list", "export", "delete", "resolve", "reopen", "reload",
             "watch", "wait", "threads", "get", "prune", "ack", "attention",
-            "help", "-h", "--help"
+            "config", "prompt", "help", "-h", "--help"
         ]
         if subcommands.contains(args[0]) {
             switch args[0] {
             case "help", "-h", "--help": printUsage(); return 0
+            case "config":  return ReviewConfig.runConfigCommand(Array(args.dropFirst()))
+            case "prompt":  return Preferences.runPromptCommand(Array(args.dropFirst()))
             case "add":     return cmdAdd(Array(args.dropFirst()))
             case "list":    return cmdList(Array(args.dropFirst()))
             case "export":  return cmdExport(Array(args.dropFirst()))
@@ -1356,6 +1360,7 @@ enum CLI {
             case "--no-stream":         stream = false
             case "--no-emit-on-exit":   emitOnExit = false
             case "--stream":            stream = true
+            case "--no-prompt":         break
             default:
                 if a.hasPrefix("--") {
                     FileHandle.standardError.write("unknown flag: \(a)\n".data(using: .utf8)!)
@@ -1473,6 +1478,49 @@ enum CLI {
 
           human-review prune   FILE.md                  Truncate events.jsonl
           human-review --help                           This text
+
+        ─── Preferences (config) ───────────────────────────────────────────────────────
+        Your review preferences travel with every command: each subcommand writes
+        them to STDERR first, so an agent reading its own transcript follows them
+        without being told to look. Stdout stays machine-parseable.
+
+          ── human-review · your review preferences (config global.prompt) ──
+          <your preference text>
+          ── follow these when you reply to comments ──
+
+        Two git-style INI files, local wins over global key by key:
+
+          ~/.human-reviewconfig            global (override path: HUMAN_REVIEW_CONFIG)
+          .human-review.config             nearest one from the working directory up
+
+            [global]
+                prompt = "be terse\\nquote the line you mean"
+                promptFile = ~/.claude/human-review-preferences.md
+                promptQuiet = false
+
+        Keys:
+          global.prompt        Preference text injected into agent transcripts.
+          global.promptFile    File holding that text. Wins over global.prompt.
+          global.promptQuiet   true → no automatic banner. `prompt` still prints.
+
+        Subcommands:
+          human-review config [--global|--local] KEY [VALUE]   Read / write one key
+          human-review config [--global|--local] --unset KEY   Remove one key
+          human-review config [--global|--local] --list        key=value lines, sorted
+          human-review config [--global|--local] --path        Path of that file
+          human-review config [--global|--local] --edit        Open it in $VISUAL/$EDITOR/vi
+          human-review prompt                                  Print the text on stdout
+
+        Reads default to the merged config; writes default to --global. That last
+        part deviates from git on purpose — the prompt is a per-user preference,
+        and a stray .human-review.config in a working directory would surprise you.
+
+        Suppress the banner:
+          global.promptQuiet = true        Always off for this user
+          HUMAN_REVIEW_NO_PROMPT=1         Off for this shell
+          --no-prompt                      Off for this command (accepted everywhere)
+
+        `config`, `prompt`, and `--help` never print the banner.
 
         ─── Complete agent flow in pure shell ──────────────────────────────────────────
           # Open a GUI for the human in the background
@@ -1956,7 +2004,7 @@ enum CLI {
             FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
         }
         return MainActor.assumeIsolated {
-            let store = ReviewStore(fileURL: url, streamToStdout: true)
+            let store = ReviewStore(fileURL: url, streamToStdout: false)
             guard store.comments.contains(where: { $0.id == id }) else {
                 FileHandle.standardError.write("comment not found: \(idStr)\n".data(using: .utf8)!); return 1
             }
@@ -2075,6 +2123,9 @@ enum CLI {
                 let line = String(leftover[..<nl])
                 leftover = String(leftover[leftover.index(after: nl)...])
                 if line.isEmpty { continue }
+
+                let isTailFileHeader = line.hasPrefix("==> ") && line.hasSuffix(" <==")
+                if isTailFileHeader { continue }
 
                 // Type filter (watch mode)
                 if let allowed = typesFilter {

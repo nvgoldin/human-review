@@ -50,6 +50,7 @@ BIN_SRC="${REPO_ROOT}/.build/release/${APP_NAME}"
 RES_BUNDLE_NAME="human-review_human-review.bundle"
 RES_BUNDLE_SRC="${REPO_ROOT}/.build/release/${RES_BUNDLE_NAME}"
 INFO_SRC="${REPO_ROOT}/bundle/Info.plist"
+ICON_SRC="${REPO_ROOT}/bundle/AppIcon.icns"
 
 if [[ ! -x "$BIN_SRC" ]]; then
   echo "✗ Build did not produce $BIN_SRC"
@@ -57,6 +58,10 @@ if [[ ! -x "$BIN_SRC" ]]; then
 fi
 if [[ ! -f "$INFO_SRC" ]]; then
   echo "✗ Missing $INFO_SRC — re-pull the repo or restore bundle/Info.plist"
+  exit 1
+fi
+if [[ ! -f "$ICON_SRC" ]]; then
+  echo "✗ Missing $ICON_SRC — rebuild it with ./icon/build-icon.sh"
   exit 1
 fi
 
@@ -78,6 +83,10 @@ if [[ -d "$RES_BUNDLE_SRC" ]]; then
   rm -rf "${APP_DIR}/${RES_BUNDLE_NAME}"
   rm -rf "${APP_MACOS}/${RES_BUNDLE_NAME}"
 fi
+
+# App icon. CFBundleIconFile in Info.plist names it without the extension, so
+# the file has to land at Contents/Resources/AppIcon.icns before codesign runs.
+cp -f "$ICON_SRC" "${APP_RES}/AppIcon.icns"
 
 # Info.plist — refreshed every build so template changes propagate.
 # Substitute CFBundleIdentifier with the resolved $BUNDLE_ID (which may have
@@ -119,6 +128,21 @@ ln -s "${APP_MACOS}/${APP_NAME}" "$LINK"
 
 # Clean up any prior raw-binary install artifacts from the pre-bundle layout.
 rm -rf "${BIN_DIR}/${RES_BUNDLE_NAME}"
+
+# Bump the bundle's mtime so Finder and the Dock drop their cached icon.
+touch "$APP_DIR"
+
+# Secret scanning for anyone working in the checkout. core.hooksPath is
+# per-clone and cannot be committed, so wire it here.
+if [[ -d "${REPO_ROOT}/.git" && -x "${REPO_ROOT}/.githooks/pre-commit" ]]; then
+  git -C "$REPO_ROOT" config core.hooksPath .githooks
+  if command -v gitleaks >/dev/null 2>&1; then
+    echo "✓ Hooks:   core.hooksPath → .githooks (gitleaks $(gitleaks version))"
+  else
+    echo "⚠  Hooks:   core.hooksPath → .githooks, but gitleaks is missing."
+    echo "            brew install gitleaks"
+  fi
+fi
 
 echo "✓ Bundle:  ${APP_DIR}"
 echo "✓ Symlink: ${LINK} → ${APP_MACOS}/${APP_NAME}"

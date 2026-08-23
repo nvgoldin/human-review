@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon-512.png" width="128" height="128" alt="human-review app icon: eyes inside an agent's ring">
+</p>
+
 # human-review
 
 Native macOS app for local, GitHub-style review of markdown and code
@@ -16,11 +20,14 @@ sidecar files.
 - `⌘F` search across code + comments + author names, floating zoom
   widget, macOS dictation via `Fn`-`Fn`, composer drafts that survive
   agent posts.
+- A per-user preferences prompt that the CLI hands back to whichever
+  agent is driving it, so your review style is enforced without you
+  restating it.
 - No web server, no daemon, no login, no network calls at runtime. The
   sidecar files are your source of truth.
 
-<sub>Screenshots pending. See [`HANDOFF.md`](HANDOFF.md) for architectural
-notes and load-bearing invariants.</sub>
+<sub>See [`HANDOFF.md`](HANDOFF.md) for architectural notes and
+load-bearing invariants.</sub>
 
 ## Install
 
@@ -34,10 +41,11 @@ cd ~/src/human-review
 ```
 
 `install.sh` builds release, assembles a `.app` bundle at
-`~/Applications/human-review.app`, ad-hoc code-signs it (needed so macOS
-attributes microphone/dictation permission to it), and symlinks
-`~/bin/human-review` at the in-bundle binary. Make sure `~/bin` is on
-your `PATH`:
+`~/Applications/human-review.app`, installs the app icon, ad-hoc
+code-signs the bundle (needed so macOS attributes microphone/dictation
+permission to it), points `core.hooksPath` at the repo's gitleaks
+pre-commit hook, and symlinks `~/bin/human-review` at the in-bundle
+binary. Make sure `~/bin` is on your `PATH`:
 
 ```bash
 export PATH="$HOME/bin:$PATH"       # add to your ~/.zshrc or ~/.bashrc
@@ -72,6 +80,13 @@ human-review a.md b.md c.md            # multi-file session; ⌘] / ⌘[ to swit
 The window has three panes: the doc/code on the left, per-block or
 per-line threads inline, and a global-chat sidebar on the right for
 whole-document conversations.
+
+![Markdown review: an active thread anchored to a paragraph, a resolved thread, and a whole-document thread in the sidebar](docs/screenshot-main.png)
+
+Code files get a line gutter, syntax highlighting, and threads anchored
+to a line:
+
+![Python file under review with two line-anchored threads open](docs/screenshot-code.png)
 
 Every change writes to three sidecars next to your source file:
 
@@ -168,6 +183,86 @@ That's the whole loop. There is no client library, no long-lived
 subprocess, no protocol beyond `--help`. The LLM invokes these
 commands via its `Bash` tool the same way it invokes `git` or `jq`.
 
+## Preferences — telling the agent how you review
+
+Every reviewer wants replies handled differently. Rather than repeating
+that to each new agent session, put it in a config file once. The CLI
+prints it to **stderr** on every command, so whichever agent is driving
+the tool reads your rules in its own transcript without being asked.
+
+```bash
+human-review config --global global.promptFile ~/.review-rules.md
+human-review prompt                    # what the agent sees
+```
+
+Then any command carries it:
+
+```console
+$ human-review add notes.md --line 12 --body "…"
+── human-review · your review preferences (config global.prompt) ──
+1. EDIT the document. It says what is true now — never append "UPDATE:".
+2. Reply fast. Acknowledge every comment the moment you see it.
+3. Spawn a subagent to do the work, so the review thread never blocks.
+── follow these when you reply to comments ──
+{ "id": "…", … }
+```
+
+Only stderr carries the banner. Stdout stays machine-parseable, so
+`human-review add … | jq -r .id` is unaffected.
+
+### `human-review config`
+
+Modelled on `git config`, with two scopes and the same key syntax:
+
+| Scope | File |
+|---|---|
+| Global | `~/.human-reviewconfig` |
+| Local | nearest `.human-review.config`, walking up from the working directory |
+
+Local wins over global. Unlike git, **writes default to `--global`** —
+the prompt is a per-user preference, and a stray config file in a working
+directory would be a surprise.
+
+```
+human-review config [--global|--local] KEY [VALUE]     get / set
+human-review config [--global|--local] --unset KEY
+human-review config [--global|--local] --list          merged when no scope given
+human-review config [--global|--local] --path
+human-review config [--global|--local] --edit          opens $VISUAL / $EDITOR / vi
+human-review prompt                                    print the effective prompt
+```
+
+| Key | Meaning |
+|---|---|
+| `global.prompt` | The preference text, inline. |
+| `global.promptFile` | Path to a file holding it. Wins over `global.prompt`. |
+| `global.promptQuiet` | `true` suppresses the banner. `human-review prompt` still works. |
+
+Suppress the banner for one command with `--no-prompt`, or for a whole
+shell with `HUMAN_REVIEW_NO_PROMPT=1`. Do that on long-lived streams such
+as `watch`, where one banner per process is noise.
+
+Keep the text short. It is injected into an agent's context on every
+call, so a page of rules costs real tokens; six lines does the job.
+
+## Claude Code skill
+
+[`skills/human-review/SKILL.md`](skills/human-review/SKILL.md) is a
+ready-made skill that teaches an agent the whole loop: open the GUI
+without blocking, arm a persistent monitor on the event stream, answer
+every comment in-thread, edit the document rather than appending to it,
+and close the session with no active threads left.
+
+Load it by symlinking it into your skills directory — the repo stays the
+source of truth, so `git pull` updates the skill:
+
+```bash
+ln -sfn ~/src/human-review/skills/human-review ~/.claude/skills/human-review
+```
+
+Then `/human-review` in a session, or a phrase like "put this doc up for
+review".
+
 ## Comment record
 
 ```jsonc
@@ -207,16 +302,44 @@ No runtime network. Ships with:
 
 ```bash
 swift build                          # debug
+./run-tests.sh                       # CLI integration suite
 swift build -c release               # release (what install.sh calls)
 ./install.sh                         # rebuild + repackage + re-sign the .app
+./icon/build-icon.sh                 # re-render bundle/AppIcon.icns from the SVG
 ```
 
 The whole GUI is `Sources/human-review/Resources/viewer.html` — you can
 iterate on the JS/CSS without touching Swift and see changes immediately
 after `./install.sh` (or `swift build -c release`) and a window reopen.
 
-Deep architectural notes and the "how did we end up here" bug log live
-in [`HANDOFF.md`](HANDOFF.md).
+### Tests
+
+`./run-tests.sh` runs a black-box suite against the built binary: it
+shells out to real subcommands in a temp directory, so it exercises the
+same surface an agent does. Every test points `HUMAN_REVIEW_CONFIG` at a
+throwaway file and never reads your real config.
+
+The suite is written with swift-testing. With Xcode installed, plain
+`swift test` runs it. With only the Command Line Tools there is no
+`XCTest.framework` on the machine and SwiftPM leaves the Command Line
+Tools framework directory off the search path, so three extra flags are
+needed — `run-tests.sh` adds them when it detects that toolchain. It also
+fails when a run reports success having executed zero tests, which is
+what you get if the test target quietly fails to link against
+`Testing.framework`.
+
+### Secret scanning
+
+`.githooks/pre-commit` runs `gitleaks git --staged` before every commit.
+`install.sh` wires `core.hooksPath` for you; to do it by hand:
+
+```bash
+brew install gitleaks
+git config core.hooksPath .githooks
+```
+
+`.gitleaks.toml` extends the default rule set and allowlists the vendored
+minified bundles, whose entropy otherwise trips the generic rules.
 
 ## Limitations
 
@@ -227,6 +350,9 @@ in [`HANDOFF.md`](HANDOFF.md).
   first 80 chars of the block as `anchorText` and re-search on `⌘R` /
   `reload`. Unmatched roots get `orphaned: true` and render in a
   separate section.
+- A running GUI cannot be told to open another file from the CLI. Pass
+  every file in the launch command, or click **Open in review** in a
+  cross-link preview.
 
 ## License
 

@@ -1,6 +1,6 @@
 # human-review · HANDOFF
 
-Snapshot for picking the project up in a fresh session. Last updated end-of-session 2026-05-28.
+Snapshot for picking the project up in a fresh session. Last updated 2026-08-23.
 
 ## TL;DR for a new agent
 
@@ -12,7 +12,7 @@ human-review file.md         # GUI mode
 human-review watch file.md   # live JSONL on stdout, auto-acks every event seen
 ```
 
-The repo is **local-only** (`git remote -v` is empty). **Never push to a remote without explicit user permission.** `./install.sh` builds a release binary, assembles a `.app` bundle at `~/Applications/human-review.app`, ad-hoc-signs it with a stable identifier, and points `~/bin/human-review` at the in-bundle executable. Always re-run `./install.sh` to ship a change.
+The repo publishes to `git@github.com:nvgoldin/human-review.git` on `main`. **Never push without explicit user permission.** Commits use a repo-local identity (`git config user.name`), not the machine's global one. `./install.sh` builds a release binary, assembles a `.app` bundle at `~/Applications/human-review.app`, ad-hoc-signs it with a stable identifier, and points `~/bin/human-review` at the in-bundle executable. Always re-run `./install.sh` to ship a change.
 
 ## Repo layout
 
@@ -21,11 +21,21 @@ The repo is **local-only** (`git remote -v` is empty). **Never push to a remote 
 ├── Package.swift                                — SwiftPM, single executable target
 ├── README.md                                    — user-facing docs (shell-first)
 ├── HANDOFF.md                                   — this file
-├── install.sh                                   — build + .app bundle + ad-hoc codesign + ~/bin symlink
+├── install.sh                                   — build + .app bundle + icon + ad-hoc codesign + ~/bin symlink + hooks
+├── .githooks/pre-commit                         — gitleaks scan of staged changes; wired by install.sh
+├── .gitleaks.toml                               — default rules + allowlist for the vendored min.js bundles
+├── icon/
+│   ├── human-review.svg                         — 1024px icon source
+│   └── build-icon.sh                            — renders the iconset and bundle/AppIcon.icns
 ├── bundle/
-│   └── Info.plist                               — template baked into the .app on every install
+│   ├── Info.plist                               — template baked into the .app on every install
+│   └── AppIcon.icns                             — built icon, copied to Contents/Resources by install.sh
+├── skills/human-review/SKILL.md                 — Claude Code skill; symlink it into ~/.claude/skills
+├── run-tests.sh                                  — builds, then runs the suite with the right toolchain flags
+├── Tests/                                       — black-box swift-testing suite driving the built binary
 ├── Sources/human-review/
 │   ├── main.swift                               — ~2200 lines: model, store, session, CLI, stdin protocol, AppDelegate
+│   ├── Config.swift                             — git-style config file + the agent preferences banner
 │   └── Resources/
 │       ├── viewer.html                          — ~2000 lines: HTML/CSS + render JS + bridge
 │       ├── marked.min.js                        — bundled (40KB) markdown → HTML
@@ -141,26 +151,31 @@ The sidebar scrollbar is also styled to be always-visible (`::-webkit-scrollbar`
 
 **`writeInlineExport` invariant.** The `.review.md` rebuild only inlines `scope == .block` comments whose `anchorLine` is in `[0, lines.count)`. Globals + orphans + stale-anchor blocks render in a separate "Document discussion" section at the bottom of `.review.md`. Earlier `start..<lines.count` traps on a stale anchor were fixed by guarding `start` and using a closed range bounded by `lastValidLine` (commit `ac16def`).
 
-## Recent commits (newest first)
+**Preferences banner (`Config.swift`).** Git-style INI config in
+`~/.human-reviewconfig` (global) and the nearest `.human-review.config` walking
+up from the working directory (local, wins). `global.prompt` or
+`global.promptFile` holds the user's review rules. Every subcommand except
+`config`, `prompt`, and `help` writes them to **stderr** before doing anything
+else, so an agent driving the CLI reads them in its own transcript. stdout stays
+untouched — `add … | jq -r .id` must keep working byte-for-byte, and the test
+suite asserts it. Suppression: `--no-prompt`, `HUMAN_REVIEW_NO_PROMPT`, or
+`global.promptQuiet`. `HUMAN_REVIEW_CONFIG` overrides the global path and is how
+the tests avoid the real one.
 
-```
-1928f40  Sidebar: grid layout for reliable scroll + auto-scroll to latest; remove post-submit focus jump
-39fbe35  Sidebar UX: scroll fix + single bottom composer with reply mode; remove auto-jump in favor of explicit attention
-6080c22  Diagram overlay: toolbar + drag-to-pan, max 2000% zoom
-cba051b  Mermaid: fix first-render race + click-to-zoom overlay
-6bbd96a  Zoom: ⌘+ / ⌘- / ⌘0 menu + trackpad pinch
-a2d5297  Canonical sorted-keys output for all event JSONL emissions
-d298d26  Mermaid: suppress + sweep stray 'Syntax error in text' bombs from body
-e014369  Add mermaid.min.js to repo (bundled resource)
-effef74  Mermaid rendering + n-key regression fix
-ac16def  Fix writeInlineExport Range trap; render globals + stale anchors in Document discussion
-6038e2b  Global (whole-doc) chat sidebar + cross-link overlay
-223c74f  Read receipts (✓✓) + markdown rendering in comment bodies
-…
-6d43407  Initial commit: human-review macOS app
-```
+An unreadable `global.promptFile` warns on stderr and lets the command run. A
+preferences path must never brick the review tool; `human-review prompt` is the
+one place it exits 1.
 
-Run `git log --oneline | head -25` from the repo for the full chain.
+**Icon.** `icon/human-review.svg` is the source. `icon/build-icon.sh` renders
+each iconset size straight from the SVG with `rsvg-convert` (not by downscaling
+one large PNG — that is what keeps the 16px render legible) and runs `iconutil`.
+`install.sh` copies `bundle/AppIcon.icns` into `Contents/Resources/` before
+codesign, and `touch`es the `.app` so the Dock drops its cached icon.
+
+## Recent commits
+
+`git log --oneline | head -25` from the repo. Nothing is duplicated here — the
+log is the record.
 
 ## Open / not-yet-built items
 
@@ -202,13 +217,26 @@ human-review --help
 human-review add /tmp/foo.md --line 1 --body "hi" --global
 human-review watch /tmp/foo.md         # leave running; auto-acks
 human-review attention /tmp/foo.md --id <uuid>
+
+# Run the suite
+./run-tests.sh
 ```
 
 ## Conventions to keep
 
 - **Greenfield migrations.** The user said "we're in greenfield, break whatever you want" early on. Don't add backwards-compat shims unless explicitly requested.
 - **No Python client.** Earlier we had one at `clients/python/`; it was deleted in `8038196` in favor of pure shell. Don't re-add unless asked.
-- **No remote on the repo.** Local-only. Don't push.
+- **Remote is `git@github.com:nvgoldin/human-review.git`.** Push to `main` only
+  with explicit permission, and only after `swift test` is green.
+- **Repo-local git identity.** `git config user.name` and `user.email` are set per
+  clone. Don't let the machine-global identity leak into a public commit.
+- **Secret scanning.** `core.hooksPath` points at `.githooks`; `gitleaks git --staged`
+  gates every commit. Never bypass it with `--no-verify`.
+- **Run the suite with `./run-tests.sh`, not `swift test`.** This machine has
+  Command Line Tools and no Xcode, so `XCTest.framework` does not exist and the
+  suite is swift-testing. Putting the needed `-F` into `Package.swift` instead
+  would make SwiftPM's synthesized runner compile away: green build, zero tests
+  run, nothing said. The script guards against exactly that.
 - **`.review.md` invariants.** Only inline-eligible block comments (scope=block, anchor in-bounds, non-orphan) get inserted inline. Everything else goes in the "Document discussion" section at the end.
 - **Output formatting.** All event JSON uses `.sortedKeys`. Don't add new emit paths that bypass this.
 - **CLI default author = "agent"** (matches stdin protocol). Headless `add` without `--author` lands as `agent`.
