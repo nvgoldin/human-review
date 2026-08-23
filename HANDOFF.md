@@ -151,6 +151,14 @@ The sidebar scrollbar is also styled to be always-visible (`::-webkit-scrollbar`
 
 **`writeInlineExport` invariant.** The `.review.md` rebuild only inlines `scope == .block` comments whose `anchorLine` is in `[0, lines.count)`. Globals + orphans + stale-anchor blocks render in a separate "Document discussion" section at the bottom of `.review.md`. Earlier `start..<lines.count` traps on a stale anchor were fixed by guarding `start` and using a closed range bounded by `lastValidLine` (commit `ac16def`).
 
+**`watch` spawns `tail -F`.** `CLI.tailAndFilter` shells out to `tail -F` and
+reads its stdout. Two consequences the code handles explicitly, and both were
+bugs before: `tail` prints a `==> path <==` header per file when following more
+than one, which has to be skipped or the JSONL stream is not parseable; and a
+killed parent orphans the `tail`, which then follows a deleted file forever, so
+`makeSignalSourcesTerminating` catches SIGTERM/SIGINT/SIGHUP and terminates the
+child first. SIGKILL cannot be caught — that case still leaks.
+
 **Preferences banner (`Config.swift`).** Git-style INI config in
 `~/.human-reviewconfig` (global) and the nearest `.human-review.config` walking
 up from the working directory (local, wins). `global.prompt` or

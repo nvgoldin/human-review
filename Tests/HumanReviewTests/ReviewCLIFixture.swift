@@ -92,6 +92,22 @@ final class ReviewCLIFixture: @unchecked Sendable {
         process.waitUntilExit()
     }
 
+    /// Command lines of running processes whose arguments contain `pattern`.
+    func runningProcesses(matching pattern: String) -> [String] {
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-fl", pattern]
+        let pipe = Pipe()
+        pgrep.standardOutput = pipe
+        pgrep.standardError = FileHandle.nullDevice
+        guard (try? pgrep.run()) != nil else { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        pgrep.waitUntilExit()
+        return String(decoding: data, as: UTF8.self)
+            .components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+    }
+
     private func makeProcess(_ arguments: [String], environment: [String: String]) -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: Self.binaryPath)

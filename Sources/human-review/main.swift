@@ -2094,6 +2094,8 @@ enum CLI {
         let exitCode = NSLock()
         var resultCode: Int32 = 0
 
+        let signalSources = makeSignalSourcesTerminating(task)
+
         // Optional timeout
         var timer: DispatchSourceTimer?
         if let t = timeout {
@@ -2155,10 +2157,26 @@ enum CLI {
         // Drain
         group.wait()
         timer?.cancel()
+        signalSources.forEach { $0.cancel() }
         exitCode.lock()
         let code = resultCode
         exitCode.unlock()
         return code
+    }
+
+    /// Kills the spawned `tail` when this process is asked to stop, so a
+    /// cancelled `watch` does not leave a `tail -F` following a deleted file.
+    static func makeSignalSourcesTerminating(_ task: Process) -> [DispatchSourceSignal] {
+        [SIGTERM, SIGINT, SIGHUP].map { signalNumber in
+            signal(signalNumber, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .global())
+            source.setEventHandler {
+                if task.isRunning { task.terminate() }
+                exit(128 + signalNumber)
+            }
+            source.resume()
+            return source
+        }
     }
 
     static func typesValue(_ args: [String]) -> String? { flagValue(args, "--types") }

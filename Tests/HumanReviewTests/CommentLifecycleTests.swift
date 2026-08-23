@@ -415,6 +415,20 @@ struct StreamingTests {
         let watchedFiles = Set(lines.compactMap { cli.jsonObject($0)?["file"] as? String })
         #expect(watchedFiles == Set([cli.path("notes.md"), cli.path("other.md")]))
     }
+
+    @Test func testTerminatingAWatchKillsItsTailChild() {
+        cli.addRootComment()
+
+        let (watcher, watcherOutput) = cli.startInBackground(["watch", "notes.md", "--from-start", "--no-ack"])
+        _ = cli.collectOutput(of: watcherOutput, until: { countLines($0) >= 1 })
+        #expect(cli.runningProcesses(matching: "tail -F .*\(cli.workingDirectory.lastPathComponent)").count == 1)
+
+        cli.terminate(watcher)
+        Thread.sleep(forTimeInterval: 0.5)
+
+        let orphans = cli.runningProcesses(matching: "tail -F .*\(cli.workingDirectory.lastPathComponent)")
+        #expect(orphans.isEmpty, "orphaned tail after the watch was terminated: \(orphans)")
+    }
 }
 
 private func countLines(_ text: String) -> Int {
