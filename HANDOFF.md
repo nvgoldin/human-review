@@ -151,6 +151,26 @@ The sidebar scrollbar is also styled to be always-visible (`::-webkit-scrollbar`
 
 **`writeInlineExport` invariant.** The `.review.md` rebuild only inlines `scope == .block` comments whose `anchorLine` is in `[0, lines.count)`. Globals + orphans + stale-anchor blocks render in a separate "Document discussion" section at the bottom of `.review.md`. Earlier `start..<lines.count` traps on a stale anchor were fixed by guarding `start` and using a closed range bounded by `lastValidLine` (commit `ac16def`).
 
+**Links leave the app; the window never navigates.** There was no navigation
+delegate at all until 2026-09-02, so clicking an `https` link replaced the whole
+review UI with the website. `LinkPolicy.decide(url:currentURL:navigationType:)`
+is the single rule, shared by the GUI coordinator and the headless renderer:
+a same-document fragment stays in-app, `.linkActivated` goes out, and so does
+any navigation to http, https, mailto, tel, ftp, sms or facetime. The GUI hands
+it to `NSWorkspace.open`, which resolves through LaunchServices to whatever the
+user set as default.
+
+The fragment check is load-bearing. An in-page anchor navigates to the viewer's
+own URL plus `#heading`; without the check that is `.linkActivated` and gets
+handed to the browser, which opens `viewer.html` in a new window.
+
+Local-file links never reach the policy — `viewer.html` intercepts any href
+starting with `/` or `file:` first and opens the cross-link preview instead.
+
+`createWebViewWith` on the GUI coordinator catches `target="_blank"`. In
+practice the policy gate usually cancels those first; it stays as the net for a
+`window.open()` from script, and is not covered by a test.
+
 **Images go through the `hrimg:` scheme, never `file:`.** Two constraints force
 this. `document.baseURI` is `viewer.html` inside the app bundle, so a relative
 image path in a reviewed file would resolve into the bundle; and

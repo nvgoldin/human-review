@@ -222,6 +222,111 @@ struct CrossLinkOverlayTests {
     }
 }
 
+@Suite("link routing")
+struct LinkRoutingTests {
+
+    let cli = ReviewCLIFixture()
+
+    @Test func testAnHTTPSLinkGoesToTheBrowserWithItsExactURL() {
+        cli.writeTextFile(named: "doc.md", contents: "# links\n\n[secure](https://example.com/page)\n")
+
+        let page = renderPage(cli, "doc.md", extraArguments: ["--click", "a[href^=\"https\"]"])
+
+        expectExactlyOneExternalOpen(in: page, of: "https://example.com/page")
+    }
+
+    @Test func testAnHTTPLinkGoesToTheBrowser() {
+        cli.writeTextFile(named: "doc.md", contents: "# links\n\n[plain](http://example.com/plain)\n")
+
+        let page = renderPage(cli, "doc.md", extraArguments: ["--click", "a[href^=\"http:\"]"])
+
+        expectExactlyOneExternalOpen(in: page, of: "http://example.com/plain")
+    }
+
+    @Test func testAMailtoLinkGoesToTheMailClient() {
+        cli.writeTextFile(named: "doc.md", contents: "# links\n\n[mail](mailto:someone@example.com)\n")
+
+        let page = renderPage(cli, "doc.md", extraArguments: ["--click", "a[href^=\"mailto\"]"])
+
+        expectExactlyOneExternalOpen(in: page, of: "mailto:someone@example.com")
+    }
+
+    @Test func testATelLinkGoesToThePhoneHandler() {
+        cli.writeTextFile(named: "doc.md", contents: "# links\n\n[phone](tel:+15550100)\n")
+
+        let page = renderPage(cli, "doc.md", extraArguments: ["--click", "a[href^=\"tel\"]"])
+
+        expectExactlyOneExternalOpen(in: page, of: "tel:+15550100")
+    }
+
+    @Test func testATargetBlankLinkGoesToTheBrowserInsteadOfDoingNothing() {
+        cli.writeTextFile(named: "doc.md", contents: """
+        # links
+
+        <a href="https://example.com/blank" target="_blank">blank</a>
+
+        """)
+
+        let page = renderPage(cli, "doc.md", extraArguments: ["--click", "a[target=\"_blank\"]"])
+
+        expectExactlyOneExternalOpen(in: page, of: "https://example.com/blank")
+    }
+
+    @Test func testAnAbsoluteLocalFileLinkOpensTheOverlayAndOpensNothingExternally() {
+        cli.writeTextFile(named: "other.md", contents: "# other\n\nthe linked body\n")
+        cli.writeTextFile(named: "doc.md",
+                          contents: "# links\n\n[the other doc](\(cli.path("other.md")))\n")
+
+        let page = renderPage(cli, "doc.md", extraArguments: ["--click", "a[href^=\"/\"]"])
+
+        #expect(page.exitCode == 0, "\(page.standardError)")
+        #expect(page.externalOpens.isEmpty, "\(page.externalOpens)")
+        #expect(page.overlayVisible, "\(page.standardError)")
+    }
+
+    @Test func testAFilePrefixedLocalLinkBehavesLikeTheAbsoluteForm() {
+        cli.writeTextFile(named: "other.md", contents: "# other\n\nthe linked body\n")
+        cli.writeTextFile(named: "doc.md",
+                          contents: "# links\n\n[the other doc](file://\(cli.path("other.md")))\n")
+
+        let page = renderPage(cli, "doc.md", extraArguments: ["--click", "a[href^=\"file:\"]"])
+
+        #expect(page.exitCode == 0, "\(page.standardError)")
+        #expect(page.externalOpens.isEmpty, "\(page.externalOpens)")
+        #expect(page.overlayVisible, "\(page.standardError)")
+    }
+
+    @Test func testAnInPageFragmentLinkStaysInTheAppAndOpensNothingExternally() {
+        cli.writeTextFile(named: "doc.md", contents: "# links\n\n[jump](#links)\n")
+
+        let page = renderPage(cli, "doc.md", extraArguments: ["--click", "a[href^=\"#\"]"])
+
+        #expect(page.exitCode == 0, "\(page.standardError)")
+        #expect(page.externalOpens.isEmpty, "\(page.externalOpens)")
+        #expect(page.overlayVisible == false, "\(page.standardError)")
+    }
+
+    @Test func testRenderingWithoutAClickOpensNothingExternally() {
+        cli.writeTextFile(named: "doc.md", contents: "# links\n\n[secure](https://example.com/page)\n")
+
+        let page = renderPage(cli, "doc.md")
+
+        #expect(page.exitCode == 0, "\(page.standardError)")
+        #expect(page.externalOpens.isEmpty, "\(page.externalOpens)")
+        #expect(page.overlayVisible == false, "\(page.standardError)")
+    }
+
+    @Test func testAClickSelectorThatMatchesNothingExitsWithOne() {
+        cli.writeTextFile(named: "doc.md", contents: "# links\n\n[secure](https://example.com/page)\n")
+
+        let result = cli.run(["render", "doc.md", "--wait", renderWaitSeconds, "--click", "a.nosuch"])
+
+        #expect(result.exitCode == 1)
+        #expect(result.standardError.contains("no element matched a.nosuch"), "\(result.standardError)")
+        #expect(result.standardOutput == "")
+    }
+}
+
 @Suite("unsafe image attributes")
 struct UnsafeImageAttributeTests {
 
@@ -360,6 +465,7 @@ private struct RenderedPage {
     let overlayVisible: Bool
     let images: [RenderedImage]
     let notes: [RenderedNote]
+    let externalOpens: [String]
 }
 
 private func renderPage(_ cli: ReviewCLIFixture, _ name: String,
@@ -381,7 +487,15 @@ private func renderPage(_ cli: ReviewCLIFixture, _ name: String,
                         blocks: report?["blocks"] as? Int ?? -1,
                         overlayVisible: report?["overlayVisible"] as? Bool ?? false,
                         images: images,
-                        notes: notes)
+                        notes: notes,
+                        externalOpens: report?["externalOpens"] as? [String] ?? [])
+}
+
+private func expectExactlyOneExternalOpen(in page: RenderedPage, of url: String,
+                                          sourceLocation: SourceLocation = #_sourceLocation) {
+    #expect(page.exitCode == 0, "\(page.standardError)", sourceLocation: sourceLocation)
+    #expect(page.externalOpens == [url], "\(page.externalOpens)", sourceLocation: sourceLocation)
+    #expect(page.overlayVisible == false, "\(page.standardError)", sourceLocation: sourceLocation)
 }
 
 private func expectOneLoadedImage(in page: RenderedPage, endingIn suffix: String,

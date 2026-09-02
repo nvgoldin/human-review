@@ -999,10 +999,34 @@ final class CommandRouter {
 
 // MARK: - WebView bridge
 
-final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
     weak var store: ReviewStore?
     weak var session: ReviewSession?
     var onReady: (() -> Void)?
+
+    /// Hands a clicked link to the user's default browser instead of
+    /// navigating the review window onto it.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        let url = navigationAction.request.url
+        switch LinkPolicy.decide(url: url, currentURL: webView.url,
+                                 navigationType: navigationAction.navigationType) {
+        case .allowInApp:
+            decisionHandler(.allow)
+        case .openExternally:
+            decisionHandler(.cancel)
+            if let url = url { NSWorkspace.shared.open(url) }
+        }
+    }
+
+    /// `target="_blank"` asks WebKit for a second window. Without this the link
+    /// silently does nothing; with it, it opens where the user expects.
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url { NSWorkspace.shared.open(url) }
+        return nil
+    }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let dict = message.body as? [String: Any], let type = dict["type"] as? String else { return }
@@ -1072,39 +1096,10 @@ final class WebViewCoordinator: NSObject, WKScriptMessageHandler, WKNavigationDe
                                        replyTo: nil, author: nil, scope: .global)
             }
         case "fetchSection":
-            // Cross-link overlay: read a referenced markdown file from disk and
-            // pass its full source back to JS, which extracts the relevant
-            // section by fragment and renders it in a modal.
             guard let path = dict["path"] as? String else { return }
-            let fragment = (dict["fragment"] as? String) ?? ""
-            let webView = message.webView
-            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let source = try String(contentsOf: url, encoding: .utf8)
-                    let payload: [String: Any] = [
-                        "path": url.path,
-                        "fragment": fragment,
-                        "source": source
-                    ]
-                    guard let data = try? JSONSerialization.data(withJSONObject: payload),
-                          let json = String(data: data, encoding: .utf8) else { return }
-                    DispatchQueue.main.async {
-                        webView?.evaluateJavaScript("if (window.hr && window.hr.showOverlay) { window.hr.showOverlay(\(json)); }")
-                    }
-                } catch {
-                    let payload: [String: Any] = [
-                        "path": url.path,
-                        "fragment": fragment,
-                        "reason": error.localizedDescription
-                    ]
-                    guard let data = try? JSONSerialization.data(withJSONObject: payload),
-                          let json = String(data: data, encoding: .utf8) else { return }
-                    DispatchQueue.main.async {
-                        webView?.evaluateJavaScript("if (window.hr && window.hr.showOverlayError) { window.hr.showOverlayError(\(json)); }")
-                    }
-                }
-            }
+            CrossLinkOverlay.deliver(path: path,
+                                     fragment: (dict["fragment"] as? String) ?? "",
+                                     to: message.webView)
         case "openInSession":
             guard let path = dict["path"] as? String else { return }
             let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
@@ -1140,6 +1135,67 @@ enum AppResources {
         if let b = Bundle(url: candidate) { return b }
         return Bundle.module
     }()
+}
+
+/// Reads a cross-linked local file and hands it to the page, which slices out
+/// the requested section and shows it in the preview overlay. Shared by the
+/// GUI's message handler and by `human-review render --overlay`.
+enum CrossLinkOverlay {
+    static func deliver(path: String, fragment: String, to webView: WKWebView?) {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+        DispatchQueue.global(qos: .userInitiated).async {
+            let payload: [String: Any]
+            let call: String
+            do {
+                payload = ["path": url.path, "fragment": fragment,
+                           "source": try String(contentsOf: url, encoding: .utf8)]
+                call = "showOverlay"
+            } catch {
+                payload = ["path": url.path, "fragment": fragment,
+                           "reason": error.localizedDescription]
+                call = "showOverlayError"
+            }
+            guard let data = try? JSONSerialization.data(withJSONObject: payload),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            DispatchQueue.main.async {
+                webView?.evaluateJavaScript("if (window.hr && window.hr.\(call)) { window.hr.\(call)(\(json)); }")
+            }
+        }
+    }
+}
+
+/// Where a navigation should happen. The review window must never navigate
+/// away from `viewer.html` — a clicked link that replaced the UI with a website
+/// would lose the session.
+enum LinkPolicy {
+    enum Decision {
+        case allowInApp
+        case openExternally
+    }
+
+    /// Schemes that always belong to the user's own applications, even when the
+    /// page tries to navigate itself there rather than the user clicking.
+    private static let externalSchemes: Set<String> = ["http", "https", "mailto", "tel", "ftp", "sms", "facetime"]
+
+    static func decide(url: URL?, currentURL: URL?, navigationType: WKNavigationType) -> Decision {
+        guard let url = url else { return .allowInApp }
+        if pointsAtSameDocument(url, as: currentURL) { return .allowInApp }
+        if navigationType == .linkActivated { return .openExternally }
+        let scheme = (url.scheme ?? "").lowercased()
+        if externalSchemes.contains(scheme) { return .openExternally }
+        return .allowInApp
+    }
+
+    /// An in-page anchor navigates to the viewer's own URL with a fragment.
+    /// Handing that to the browser would open `viewer.html` in a new window.
+    private static func pointsAtSameDocument(_ url: URL, as current: URL?) -> Bool {
+        guard let current = current else { return false }
+        var target = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        var here = URLComponents(url: current, resolvingAgainstBaseURL: false)
+        target?.fragment = nil
+        here?.fragment = nil
+        return target?.url == here?.url
+    }
 }
 
 /// Serves local image files to the viewer over the `hrimg:` scheme.
@@ -1188,24 +1244,27 @@ final class ImageSchemeHandler: NSObject, WKURLSchemeHandler {
 /// Loads the viewer in an offscreen WKWebView, applies one file's state, then
 /// reports what rendered. Used by `human-review render`.
 @MainActor
-final class HeadlessRenderer: NSObject, WKNavigationDelegate {
+final class HeadlessRenderer: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
     private let store: ReviewStore
     private let viewerURL: URL
     private let size: CGSize
     private let outPath: String?
     private let settleSeconds: Double
     private let overlayURL: URL?
+    private let clickSelector: String?
+    private var externalOpens: [String] = []
     private var webView: WKWebView!
     private var window: NSWindow!
 
     init(store: ReviewStore, viewerURL: URL, size: CGSize, outPath: String?,
-         settleSeconds: Double, overlayURL: URL? = nil) {
+         settleSeconds: Double, overlayURL: URL? = nil, clickSelector: String? = nil) {
         self.store = store
         self.viewerURL = viewerURL
         self.size = size
         self.outPath = outPath
         self.settleSeconds = settleSeconds
         self.overlayURL = overlayURL
+        self.clickSelector = clickSelector
         super.init()
     }
 
@@ -1213,7 +1272,9 @@ final class HeadlessRenderer: NSObject, WKNavigationDelegate {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let config = WKWebViewConfiguration()
-        config.userContentController = WKUserContentController()
+        let controller = WKUserContentController()
+        controller.add(self, name: "swift")
+        config.userContentController = controller
         config.setURLSchemeHandler(ImageSchemeHandler(), forURLScheme: ImageSchemeHandler.scheme)
         webView = WKWebView(frame: CGRect(origin: .zero, size: size), configuration: config)
         webView.navigationDelegate = self
@@ -1227,6 +1288,34 @@ final class HeadlessRenderer: NSObject, WKNavigationDelegate {
             exit(1)
         }
         app.run()
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        let url = navigationAction.request.url
+        switch LinkPolicy.decide(url: url, currentURL: webView.url,
+                                 navigationType: navigationAction.navigationType) {
+        case .allowInApp:
+            decisionHandler(.allow)
+        case .openExternally:
+            decisionHandler(.cancel)
+            recordExternalOpen(url?.absoluteString ?? "")
+        }
+    }
+
+    private func recordExternalOpen(_ url: String) {
+        externalOpens.append(url)
+    }
+
+    /// Only the messages that change what renders. Everything else the page
+    /// sends is a GUI-session concern with no meaning here.
+    func userContentController(_ controller: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard let dict = message.body as? [String: Any],
+              dict["type"] as? String == "fetchSection",
+              let path = dict["path"] as? String else { return }
+        CrossLinkOverlay.deliver(path: path, fragment: (dict["fragment"] as? String) ?? "",
+                                 to: message.webView)
     }
 
     nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
@@ -1243,7 +1332,25 @@ final class HeadlessRenderer: NSObject, WKNavigationDelegate {
         MarkdownWebView.pushState(webView: webView, store: store)
         openOverlayIfRequested()
         DispatchQueue.main.asyncAfter(deadline: .now() + settleSeconds) {
-            Task { @MainActor in self.report() }
+            Task { @MainActor in self.clickIfRequestedThenReport() }
+        }
+    }
+
+    private func clickIfRequestedThenReport() {
+        guard let selector = clickSelector else { report(); return }
+        guard let data = try? JSONSerialization.data(withJSONObject: [selector]),
+              let quoted = String(data: data, encoding: .utf8)?.dropFirst().dropLast() else {
+            report(); return
+        }
+        let js = "var el = document.querySelector(\(quoted)); if (el) { el.click(); } !!el"
+        webView.evaluateJavaScript(js) { matched, _ in
+            if (matched as? Bool) != true {
+                FileHandle.standardError.write("no element matched \(selector)\n".data(using: .utf8)!)
+                exit(1)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                Task { @MainActor in self.report() }
+            }
         }
     }
 
@@ -1278,15 +1385,29 @@ final class HeadlessRenderer: NSObject, WKNavigationDelegate {
           })
         })
         """
+        let opened = externalOpens
         webView.evaluateJavaScript(js) { value, error in
             if let error = error {
                 FileHandle.standardError.write("render probe failed: \(error.localizedDescription)\n".data(using: .utf8)!)
                 exit(1)
             }
-            print((value as? String) ?? "{}")
+            print(Self.merge(reportJSON: (value as? String) ?? "{}", externalOpens: opened))
             fflush(stdout)
             Task { @MainActor in self.writeSnapshotAndExit() }
         }
+    }
+
+    /// Folds the externally-opened URLs into the page report so the whole
+    /// result is one JSON object on stdout.
+    static func merge(reportJSON: String, externalOpens: [String]) -> String {
+        guard let data = reportJSON.data(using: .utf8),
+              var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return reportJSON
+        }
+        object["externalOpens"] = externalOpens
+        guard let merged = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+              let text = String(data: merged, encoding: .utf8) else { return reportJSON }
+        return text
     }
 
     private func writeSnapshotAndExit() {
@@ -1329,6 +1450,7 @@ struct MarkdownWebView: NSViewRepresentable {
         config.setURLSchemeHandler(ImageSchemeHandler(), forURLScheme: ImageSchemeHandler.scheme)
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsMagnification = true                  // pinch-to-zoom on trackpads
         // Safari Web Inspector → Develop ▸ <your machine> ▸ human-review.
@@ -1796,8 +1918,11 @@ enum CLI {
         Clicking that link in the GUI opens a modal showing just the section
         whose heading matches the fragment (auto-slug or substring match).
         The overlay has an "Open in review" button that adds the linked file
-        to the running session so you can comment on it too. http/https links
-        keep their default behavior (open in your browser).
+        to the running session so you can comment on it too.
+
+        Every other link — http, https, mailto, tel — is handed to your default
+        browser or mail client. The review window never navigates away from
+        itself, so a stray click cannot cost you the session.
 
         Reading order on file open. When you switch into a file:
           1. If there are unresolved global threads, the sidebar scrolls them
@@ -2301,7 +2426,8 @@ enum CLI {
             let renderer = HeadlessRenderer(store: store, viewerURL: viewerURL,
                                             size: CGSize(width: width, height: height),
                                             outPath: outPath, settleSeconds: settle,
-                                            overlayURL: overlayURL)
+                                            overlayURL: overlayURL,
+                                            clickSelector: flagValue(args, "--click"))
             renderer.run()
             return 0
         }

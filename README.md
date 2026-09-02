@@ -336,6 +336,19 @@ ln -sfn ~/src/human-review/skills/human-review ~/.claude/skills/human-review
 Then `/human-review` in a session, or a phrase like "put this doc up for
 review".
 
+## Links
+
+A markdown link to another **local file** opens as a preview overlay inside the
+window, with an **Open in review** button that adds it to the session:
+
+```markdown
+satisfies [the FSR](/Users/me/docs/fsr.md#section-6-4)
+```
+
+**Every other link opens in your default browser** — `http`, `https`, `mailto`,
+`tel`, and `target="_blank"` alike. The review window never navigates away from
+itself, so a stray click cannot cost you the session.
+
 ## Comment record
 
 ```jsonc

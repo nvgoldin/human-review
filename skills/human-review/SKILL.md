@@ -235,7 +235,9 @@ Bodies render as GitHub-flavored markdown in the GUI, so styling is not decorati
   the comment.
 - Keep it to a few lines. The comment column is narrow.
 - Absolute markdown links to other local files open as a preview overlay:
-  `see [the spec](/Users/me/docs/spec.md#anchoring)`.
+  `see [the spec](/Users/me/docs/spec.md#anchoring)`. Every other link — http,
+  https, mailto — opens in the human's default browser, so linking out is safe:
+  it never navigates the review window away.
 - Images render, in comment bodies as well as in the document:
   `![what it looks like](shots/run.png)`. A relative path resolves against the
   directory of the file under review. Nothing is fetched over the network, so an
