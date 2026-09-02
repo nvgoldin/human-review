@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import WebKit
 import CryptoKit
+import UniformTypeIdentifiers
 import Darwin
 import Combine
 
@@ -105,6 +106,10 @@ struct ViewerPayload: Codable {
     /// markdown renderer (marked.js + mermaid) and per-line syntax-highlighted
     /// code rendering (highlight.js).
     let fileExt: String
+    /// Directory holding the source file. The page resolves relative image
+    /// paths against it — `document.baseURI` points at the resource bundle,
+    /// not at the document.
+    let fileDir: String
 }
 
 struct FileSummary: Codable {
@@ -1137,6 +1142,174 @@ enum AppResources {
     }()
 }
 
+/// Serves local image files to the viewer over the `hrimg:` scheme.
+///
+/// The page cannot use `file:` URLs: `loadFileURL(_:allowingReadAccessTo:)`
+/// scopes WebKit's read access to the directory holding `viewer.html`, which is
+/// inside the app bundle, so every path outside it is refused. A scheme handler
+/// reads the bytes in Swift instead, and streams them rather than inlining them
+/// in the payload that gets re-pushed on every mutation.
+final class ImageSchemeHandler: NSObject, WKURLSchemeHandler {
+    static let scheme = "hrimg"
+
+    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
+        guard let url = task.request.url else {
+            task.didFailWithError(URLError(.badURL)); return
+        }
+        let path = ImageSchemeHandler.canonicalPath(url.path)
+        guard let data = FileManager.default.contents(atPath: path) else {
+            task.didFailWithError(URLError(.fileDoesNotExist)); return
+        }
+        let response = URLResponse(url: url, mimeType: ImageSchemeHandler.mimeType(ofPath: path),
+                                   expectedContentLength: data.count, textEncodingName: nil)
+        task.didReceive(response)
+        task.didReceive(data)
+        task.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+
+    /// Absolute path with `.`, `..`, `~` and symlinks resolved. `/tmp` and
+    /// `/var` are symlinks on macOS, so comparing unresolved paths misleads.
+    static func canonicalPath(_ path: String) -> String {
+        let standardized = (path as NSString).standardizingPath
+        return URL(fileURLWithPath: standardized).resolvingSymlinksInPath().path
+    }
+
+    static func mimeType(ofPath path: String) -> String {
+        let ext = (path as NSString).pathExtension
+        if let type = UTType(filenameExtension: ext), let mime = type.preferredMIMEType {
+            return mime
+        }
+        return "application/octet-stream"
+    }
+}
+
+/// Loads the viewer in an offscreen WKWebView, applies one file's state, then
+/// reports what rendered. Used by `human-review render`.
+@MainActor
+final class HeadlessRenderer: NSObject, WKNavigationDelegate {
+    private let store: ReviewStore
+    private let viewerURL: URL
+    private let size: CGSize
+    private let outPath: String?
+    private let settleSeconds: Double
+    private let overlayURL: URL?
+    private var webView: WKWebView!
+    private var window: NSWindow!
+
+    init(store: ReviewStore, viewerURL: URL, size: CGSize, outPath: String?,
+         settleSeconds: Double, overlayURL: URL? = nil) {
+        self.store = store
+        self.viewerURL = viewerURL
+        self.size = size
+        self.outPath = outPath
+        self.settleSeconds = settleSeconds
+        self.overlayURL = overlayURL
+        super.init()
+    }
+
+    func run() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let config = WKWebViewConfiguration()
+        config.userContentController = WKUserContentController()
+        config.setURLSchemeHandler(ImageSchemeHandler(), forURLScheme: ImageSchemeHandler.scheme)
+        webView = WKWebView(frame: CGRect(origin: .zero, size: size), configuration: config)
+        webView.navigationDelegate = self
+        window = NSWindow(contentRect: CGRect(origin: .zero, size: size),
+                          styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = webView
+        window.orderBack(nil)
+        webView.loadFileURL(viewerURL, allowingReadAccessTo: viewerURL.deletingLastPathComponent())
+        DispatchQueue.main.asyncAfter(deadline: .now() + settleSeconds + 20) {
+            FileHandle.standardError.write("render timed out\n".data(using: .utf8)!)
+            exit(1)
+        }
+        app.run()
+    }
+
+    nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
+                             withError error: Error) {
+        FileHandle.standardError.write("viewer failed to load: \(error.localizedDescription)\n".data(using: .utf8)!)
+        exit(1)
+    }
+
+    nonisolated func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        Task { @MainActor in self.applyStateThenReport() }
+    }
+
+    private func applyStateThenReport() {
+        MarkdownWebView.pushState(webView: webView, store: store)
+        openOverlayIfRequested()
+        DispatchQueue.main.asyncAfter(deadline: .now() + settleSeconds) {
+            Task { @MainActor in self.report() }
+        }
+    }
+
+    /// Opens the cross-link preview on a linked file, the way clicking a
+    /// markdown link to another local file does. Images inside it resolve
+    /// against that file's directory, not the reviewed one.
+    private func openOverlayIfRequested() {
+        guard let overlayURL = overlayURL else { return }
+        guard let source = try? String(contentsOf: overlayURL, encoding: .utf8) else {
+            FileHandle.standardError.write("cannot read overlay file: \(overlayURL.path)\n".data(using: .utf8)!)
+            exit(1)
+        }
+        let payload: [String: Any] = ["path": overlayURL.path, "fragment": "", "source": source]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("window.hr.showOverlay(\(json)); 'ok'", completionHandler: nil)
+    }
+
+    private func report() {
+        let js = """
+        JSON.stringify({
+          blocks: document.querySelectorAll('.block').length,
+          images: Array.from(document.querySelectorAll('img')).map(function (i) {
+            return { src: i.getAttribute('src') || '', width: i.naturalWidth,
+                     loaded: i.complete && i.naturalWidth > 0,
+                     attributes: Array.from(i.attributes).map(function (a) { return a.name; }).sort() };
+          }),
+          overlayVisible: !!document.querySelector('#overlay.visible'),
+          notes: Array.from(document.querySelectorAll('.img-note')).map(function (n) {
+            return { kind: n.classList.contains('blocked') ? 'blocked' : 'missing',
+                     text: n.textContent.trim() };
+          })
+        })
+        """
+        webView.evaluateJavaScript(js) { value, error in
+            if let error = error {
+                FileHandle.standardError.write("render probe failed: \(error.localizedDescription)\n".data(using: .utf8)!)
+                exit(1)
+            }
+            print((value as? String) ?? "{}")
+            fflush(stdout)
+            Task { @MainActor in self.writeSnapshotAndExit() }
+        }
+    }
+
+    private func writeSnapshotAndExit() {
+        guard let outPath = outPath else { exit(0) }
+        let config = WKSnapshotConfiguration()
+        config.rect = CGRect(origin: .zero, size: size)
+        webView.takeSnapshot(with: config) { image, error in
+            guard let image = image, let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]) else {
+                FileHandle.standardError.write("snapshot failed: \(error?.localizedDescription ?? "no image")\n".data(using: .utf8)!)
+                exit(1)
+            }
+            do { try png.write(to: URL(fileURLWithPath: outPath)) }
+            catch {
+                FileHandle.standardError.write("cannot write \(outPath): \(error.localizedDescription)\n".data(using: .utf8)!)
+                exit(1)
+            }
+            exit(0)
+        }
+    }
+}
+
 struct MarkdownWebView: NSViewRepresentable {
     @ObservedObject var store: ReviewStore
     var session: ReviewSession?
@@ -1153,6 +1326,7 @@ struct MarkdownWebView: NSViewRepresentable {
         let controller = WKUserContentController()
         controller.add(context.coordinator, name: "swift")
         config.userContentController = controller
+        config.setURLSchemeHandler(ImageSchemeHandler(), forURLScheme: ImageSchemeHandler.scheme)
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
@@ -1193,7 +1367,8 @@ struct MarkdownWebView: NSViewRepresentable {
             comments: store.comments,
             pendingAttention: store.pendingAttention?.uuidString,
             pageZoom: Double(pageZoom),
-            fileExt: store.fileURL.pathExtension.lowercased()
+            fileExt: store.fileURL.pathExtension.lowercased(),
+            fileDir: store.fileURL.deletingLastPathComponent().path
         )
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
@@ -1327,7 +1502,7 @@ enum CLI {
         let subcommands: Set<String> = [
             "add", "list", "export", "delete", "resolve", "reopen", "reload",
             "watch", "wait", "threads", "get", "prune", "ack", "attention",
-            "config", "prompt", "help", "-h", "--help"
+            "render", "config", "prompt", "help", "-h", "--help"
         ]
         if subcommands.contains(args[0]) {
             switch args[0] {
@@ -1348,6 +1523,7 @@ enum CLI {
             case "prune":   return cmdPrune(Array(args.dropFirst()))
             case "ack":     return cmdAck(Array(args.dropFirst()))
             case "attention": return cmdAttention(Array(args.dropFirst()))
+            case "render":  return cmdRender(Array(args.dropFirst()))
             default: break
             }
         }
@@ -1478,6 +1654,42 @@ enum CLI {
 
           human-review prune   FILE.md                  Truncate events.jsonl
           human-review --help                           This text
+
+        ─── Images ─────────────────────────────────────────────────────────────────────
+        Markdown images render. CommonMark inline and reference-style forms both
+        work, as does a raw <img> tag:
+
+            ![architecture](diagrams/flow.png)
+            ![screenshot](../shots/run.png "hover title")
+            ![logo][brand]        …        [brand]: assets/logo.svg
+
+        A relative path resolves against the directory holding the file being
+        reviewed, not the working directory. Absolute paths work. `data:` URIs
+        render as-is.
+
+        Sizing. CommonMark defines no syntax for image dimensions and neither
+        does GFM, so none is invented here. Use a raw <img> tag, which is what
+        GitHub and Typora tell you to do:
+
+            <img src="diagrams/flow.png" width="480" alt="the flow">
+
+        The `{width=50%}` and `=100x200` forms seen elsewhere are renderer
+        extensions, not standards, and marked implements neither.
+
+        Nothing is fetched over the network. An http/https image is not
+        requested at all — it renders as a visible "not fetched" marker showing
+        the URL. A path that does not exist renders as an "image not found"
+        marker. Neither fails silently.
+
+        Render a file without opening a window, to check it in a script:
+
+          human-review render FILE.md [--out shot.png] [--width N] [--height N]
+                                      [--overlay LINKED.md] [--wait S]
+              Prints a JSON report — block count, every image with whether it
+              loaded and which attributes survived, and every blocked/missing
+              marker. With --out, also writes a PNG of the rendered page.
+              --overlay opens the cross-link preview on another file, so images
+              in a linked document can be checked too.
 
         ─── Preferences (config) ───────────────────────────────────────────────────────
         Your review preferences travel with every command: each subcommand writes
@@ -2052,6 +2264,46 @@ enum CLI {
         } catch {
             FileHandle.standardError.write("prune failed: \(error.localizedDescription)\n".data(using: .utf8)!)
             return 1
+        }
+    }
+
+    /// Renders a file exactly as the GUI does, without opening a window, and
+    /// reports what the page made of it. Answers "does this document render
+    /// correctly" from a script: every image is reported as loaded, blocked or
+    /// missing, and `--out` writes a PNG of the result.
+    static func cmdRender(_ args: [String]) -> Int32 {
+        guard let file = args.first(where: { !$0.hasPrefix("--") }) else {
+            FileHandle.standardError.write("usage: human-review render FILE [--out PNG] [--width N] [--height N] [--wait S] [--overlay LINKED.md]\n".data(using: .utf8)!)
+            return 2
+        }
+        let url = resolveURL(file)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            FileHandle.standardError.write("file not found: \(file)\n".data(using: .utf8)!); return 1
+        }
+        guard let viewerURL = AppResources.bundle.url(forResource: "viewer", withExtension: "html") else {
+            FileHandle.standardError.write("viewer.html missing from the resource bundle\n".data(using: .utf8)!); return 1
+        }
+        let outPath = flagValue(args, "--out")
+        let width = flagValue(args, "--width").flatMap { Double($0) } ?? 1200
+        let height = flagValue(args, "--height").flatMap { Double($0) } ?? 900
+        let settle = flagValue(args, "--wait").flatMap { Double($0) } ?? 2.0
+        var overlayURL: URL? = nil
+        if let overlay = flagValue(args, "--overlay") {
+            let candidate = resolveURL(overlay)
+            guard FileManager.default.fileExists(atPath: candidate.path) else {
+                FileHandle.standardError.write("overlay file not found: \(overlay)\n".data(using: .utf8)!); return 1
+            }
+            overlayURL = candidate
+        }
+
+        return MainActor.assumeIsolated {
+            let store = ReviewStore(fileURL: url, streamToStdout: false)
+            let renderer = HeadlessRenderer(store: store, viewerURL: viewerURL,
+                                            size: CGSize(width: width, height: height),
+                                            outPath: outPath, settleSeconds: settle,
+                                            overlayURL: overlayURL)
+            renderer.run()
+            return 0
         }
     }
 

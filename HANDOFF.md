@@ -151,6 +151,70 @@ The sidebar scrollbar is also styled to be always-visible (`::-webkit-scrollbar`
 
 **`writeInlineExport` invariant.** The `.review.md` rebuild only inlines `scope == .block` comments whose `anchorLine` is in `[0, lines.count)`. Globals + orphans + stale-anchor blocks render in a separate "Document discussion" section at the bottom of `.review.md`. Earlier `start..<lines.count` traps on a stale anchor were fixed by guarding `start` and using a closed range bounded by `lastValidLine` (commit `ac16def`).
 
+**Images go through the `hrimg:` scheme, never `file:`.** Two constraints force
+this. `document.baseURI` is `viewer.html` inside the app bundle, so a relative
+image path in a reviewed file would resolve into the bundle; and
+`loadFileURL(_:allowingReadAccessTo:)` scopes WebKit's read access to that same
+bundle directory, so every `file:` URL outside it is refused. `ImageSchemeHandler`
+reads the bytes in Swift instead. It streams rather than inlining: `pushState`
+re-sends the whole payload on **every mutation**, so `data:` URIs would push
+megabytes of base64 per comment.
+
+`resolveImagesIn` in `viewer.html` rewrites each `<img src>` after parsing —
+`data:` untouched, any other scheme blocked before a request is made and
+replaced with a visible marker, everything else resolved against `payload.fileDir`
+and pointed at `hrimg://`. The three render paths use different base
+directories: document blocks and comment bodies use the reviewed file's
+directory, the cross-link overlay uses the linked file's.
+
+Canonicalize paths with `standardizingPath` **then** `resolvingSymlinksInPath`.
+`/tmp` and `/var` are symlinks on macOS, and comparing unresolved paths gives
+wrong answers.
+
+The path policy is deliberately permissive — any local file the reader can read.
+It is not a security boundary and must not be described as one: `marked` passes
+raw HTML through, so a hostile markdown file can already run script in the
+viewer. The property actually worth keeping is that no image causes a network
+call.
+
+**marked does not escape the image description.** At the bundled v15.0.12,
+`![" onerror="alert(1)](x.png)` renders as
+`<img src="x.png" alt="" onerror="alert(1)">` — the description closes the `alt`
+attribute and injects its own. `title` *is* escaped; `alt` is not. Upstream fixed
+it in marked 17.0.3. Until the bundle is upgraded, `stripUnsafeImageAttributes`
+removes every `on*` attribute and `srcset` from each image during the rewrite.
+A legitimate `width`/`height` on a raw `<img>` survives on purpose — that is the
+only supported way to size an image.
+
+**Open, pre-existing, and larger than the image work:** the viewer has no CSP
+and no sanitizer, `gfm: true` does not enable GFM's tagfilter in marked, and
+`marked.parse()` output goes straight to `innerHTML`. A raw `<script>` tag in a
+reviewed markdown file executes. Fixing that means a CSP or DOMPurify, both of
+which have to be checked against mermaid and hljs, so it was left alone rather
+than half-done. Nothing in the image path makes it worse, and the image path
+does not depend on it being fixed.
+
+**No image sizing syntax is invented.** CommonMark defines none and neither does
+GFM; `{width=50%}` (Pandoc, GitLab, Quarto) and `=100x200` (markdown-it-imsize,
+HedgeDoc) are renderer extensions and marked implements neither. Raw `<img>` is
+the answer, same as GitHub and Typora. If sizing is ever wanted in markdown
+syntax, `{width=…}` has the broadest real-world backing and needs a marked
+extension.
+
+**Link reference definitions are collected file-wide.** `splitBlocks` cuts on
+blank lines and each block is parsed alone, so a `[label]: target` definition in
+its own block is invisible to the block using it. `collectLinkDefinitions`
+gathers them once and `withLinkDefinitions` appends them to every block before
+parsing. Without this, reference-style images and links silently render as
+nothing.
+
+**`human-review render`** loads the viewer in an offscreen `WKWebView`, applies
+one file's state, and prints what rendered — block count, every image with
+whether it loaded, every blocked/missing marker — optionally writing a PNG. It
+is how the GUI gets tested: the machine has no Screen Recording permission, so
+`screencapture` returns only the wallpaper, and this is the only way to verify
+the rendered page in the real engine.
+
 **`watch` spawns `tail -F`.** `CLI.tailAndFilter` shells out to `tail -F` and
 reads its stdout. Two consequences the code handles explicitly, and both were
 bugs before: `tail` prints a `==> path <==` header per file when following more

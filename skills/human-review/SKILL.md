@@ -206,6 +206,7 @@ human-review wait     FILE --exit [--timeout S]
 Preferences:
 
 ```
+human-review render   FILE [--out PNG]                # check how a file renders
 human-review prompt                                   # the user's review rules
 human-review config --list
 human-review config --global global.prompt "TEXT"
@@ -235,6 +236,21 @@ Bodies render as GitHub-flavored markdown in the GUI, so styling is not decorati
 - Keep it to a few lines. The comment column is narrow.
 - Absolute markdown links to other local files open as a preview overlay:
   `see [the spec](/Users/me/docs/spec.md#anchoring)`.
+- Images render, in comment bodies as well as in the document:
+  `![what it looks like](shots/run.png)`. A relative path resolves against the
+  directory of the file under review. Nothing is fetched over the network, so an
+  `https://` image renders as a "not fetched" marker — point at a local file, or
+  save the image next to the document first.
+
+Before you claim a document renders correctly, check it rather than assuming:
+
+```bash
+human-review render /abs/path/a.md --out /tmp/check.png
+```
+
+It prints one JSON line — block count, every image with whether it loaded, and
+every blocked or missing marker — and writes a PNG you can look at. Use it after
+you add images to a document, and after any edit that moves image paths.
 
 ## Sidecar files
 

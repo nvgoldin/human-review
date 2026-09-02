@@ -142,6 +142,15 @@ human-review threads FILE [--active|--settled]  # thread roots + reply counts
 human-review get     FILE --id UUID             # one comment
 ```
 
+### Render
+
+```
+human-review render FILE [--out PNG] [--overlay LINKED.md]   # check how a file renders
+```
+
+Prints a JSON report of what rendered and, with `--out`, a PNG. See
+[Images](#images).
+
 ### Subscribe
 
 ```
@@ -182,6 +191,70 @@ human-review resolve notes.md --id "$ROOT"
 That's the whole loop. There is no client library, no long-lived
 subprocess, no protocol beyond `--help`. The LLM invokes these
 commands via its `Bash` tool the same way it invokes `git` or `jq`.
+
+## Images
+
+Markdown images render, in the document and in comment bodies alike. All four
+CommonMark forms work — inline, full reference, collapsed, shortcut — plus a
+raw `<img>` tag:
+
+```markdown
+![architecture](diagrams/flow.png)
+![screenshot](../shots/run.png "hover title")
+![logo][brand]
+
+[brand]: assets/logo.svg
+```
+
+A relative path resolves against the directory holding the file under review,
+not your working directory. Absolute paths work. `data:` URIs render as-is.
+
+![A diagram rendered inline in a reviewed markdown file, with a comment thread anchored to it](docs/screenshot-images.png)
+
+**Nothing is fetched over the network.** An `http`/`https` image is never
+requested — it renders as a visible marker showing the URL, so you can see that
+the document wanted one. A path that does not exist renders as an "image not
+found" marker with the resolved path. Neither fails silently.
+
+### Sizing
+
+CommonMark defines no syntax for image dimensions, and neither does GFM. The
+`{width=50%}` (Pandoc, GitLab, Quarto) and `=100x200` (markdown-it-imsize,
+HedgeDoc) forms are renderer extensions, not standards, and the bundled marked
+implements neither. Rather than invent a dialect, use a raw `<img>` — the same
+answer GitHub and Typora give:
+
+```html
+<img src="diagrams/flow.png" width="480" alt="the flow">
+```
+
+### Checking a file renders
+
+```bash
+human-review render notes.md --out /tmp/check.png
+```
+
+Loads the real viewer offscreen and prints one JSON line — block count, every
+image with whether it loaded, and every blocked or missing marker — then writes
+a PNG. Useful in a script, and it is how the GUI itself is tested.
+
+### How it works, and what it does not protect you from
+
+Images are served over an internal `hrimg:` URL scheme rather than `file:`. Two
+reasons: the page's base URL is `viewer.html` inside the `.app`, so relative
+paths would resolve into the bundle; and WebKit's read access is scoped to that
+same bundle directory, so `file:` URLs elsewhere are refused. Serving the bytes
+from Swift also avoids inlining images into the payload, which is re-sent on
+every comment.
+
+Any local file you can read can be referenced. That is deliberate, and it is
+not a security boundary: marked passes raw HTML through, so a hostile markdown
+file can already run script in the viewer regardless of how image paths are
+treated. Event-handler attributes and `srcset` are stripped from every image —
+marked 15 does not escape the image description, so `![" onerror="…](x.png)`
+would otherwise inject one — but **review markdown you do not trust at your own
+risk.** The property that is guaranteed is the offline one: no image causes a
+network call.
 
 ## Preferences — telling the agent how you review
 

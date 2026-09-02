@@ -926,6 +926,38 @@
     mark.search-hit         { background: rgba(255,200,80,0.32); color: inherit; }
     mark.search-hit.current { background: #ffaf0a; color: #1d1d1f; }
   }
+
+  /* ── Images ──────────────────────────────────────────────────────────────
+     Sources are rewritten to the hrimg: scheme before paint; see
+     resolveImagesIn(). Cap them to the column so a full-resolution
+     screenshot doesn't blow the layout out. */
+  .block-body img, .comment-body img, .overlay-body img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+    display: block;
+    margin: 0.4em 0;
+  }
+  .block-body img[align="left"], .block-body img[align="right"] { display: inline; }
+  .img-note {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.4em;
+    padding: 0.25em 0.55em;
+    border: 1px dashed #c7c7cc;
+    border-radius: 6px;
+    background: #fafafa;
+    color: #6e6e73;
+    font-size: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  .img-note code {
+    font-size: 11px;
+    color: #48484a;
+    word-break: break-all;
+  }
+  .img-note.blocked { border-color: #d9a441; background: #fff9ec; color: #8a5a00; }
+  .img-note.missing { border-color: #e0a0a0; background: #fdf2f2; color: #9a2b2b; }
 </style>
 <script src="marked.min.js"></script>
 <script src="mermaid.min.js"></script>
@@ -1013,6 +1045,8 @@
 
 const state = {
   blocks: [],            // [{start, text}]
+  fileDir: '',           // directory of the source file; relative image paths resolve against it
+  linkDefs: '',          // every [label]: target line in the file, appended to each block before parsing
   comments: [],          // flat list from Swift
   newComposerBlock: null,  // line of block where the user is composing a NEW thread
   replyComposerRoot: null, // root id of thread the user is replying to
@@ -1110,6 +1144,127 @@ function splitBlocks(src) {
   }
   if (cur.length) blocks.push({ start: curStart, text: cur.join('\n') });
   return blocks;
+}
+
+// ─── Images ────────────────────────────────────────────────────────────────
+// document.baseURI is the resource bundle inside the .app, not the document
+// being reviewed, so every relative image path in a markdown file would
+// otherwise resolve into the bundle. And WebKit refuses file: URLs outside the
+// directory passed to loadFileURL(_:allowingReadAccessTo:). So each <img> gets
+// its src rewritten to the hrimg: scheme, which Swift serves from disk.
+
+// Link reference definitions ([label]: target) collected from the WHOLE file.
+// Blocks are parsed one at a time, so a definition sitting in its own block is
+// invisible to the block that uses it; appending them to every block is what
+// makes reference-style images and links resolve.
+function collectLinkDefinitions(src) {
+  const defs = [];
+  let inFence = false, fenceMarker = '';
+  for (const line of src.split('\n')) {
+    const fence = line.match(/^(\s*)(```+|~~~+)/);
+    if (fence) {
+      if (!inFence) { inFence = true; fenceMarker = fence[2]; }
+      else if (line.includes(fenceMarker)) { inFence = false; }
+      continue;
+    }
+    if (inFence) continue;
+    if (/^ {0,3}\[[^\]]+\]:\s*\S+/.test(line)) defs.push(line.trim());
+  }
+  return defs.join('\n');
+}
+
+function withLinkDefinitions(text) {
+  if (!state.linkDefs) return text;
+  return text + '\n\n' + state.linkDefs;
+}
+
+// Collapse '.' and '..' segments. The Swift handler canonicalizes again before
+// reading — this side is for a tidy, comparable URL, not for enforcement.
+function normalizePath(path) {
+  const out = [];
+  for (const segment of path.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') { out.pop(); continue; }
+    out.push(segment);
+  }
+  return '/' + out.join('/');
+}
+
+function decodePathSegment(segment) {
+  try { return decodeURIComponent(segment); } catch (_) { return segment; }
+}
+
+// Returns {kind:'inline'} to leave the src alone, {kind:'blocked'} for anything
+// that would reach the network, or {kind:'file', url} pointing at hrimg:.
+function resolveImageSource(raw, baseDir) {
+  const src = (raw || '').trim();
+  if (!src) return { kind: 'blocked', reason: 'empty source' };
+  if (/^data:/i.test(src)) return { kind: 'inline' };
+  if (/^hrimg:/i.test(src)) return { kind: 'inline' };
+
+  let path = null;
+  const schemeMatch = src.match(/^([a-z][a-z0-9+.\-]*):/i);
+  if (schemeMatch && schemeMatch[1].toLowerCase() === 'file') {
+    path = src.replace(/^file:\/\//i, '');
+  } else if (schemeMatch) {
+    return { kind: 'blocked', reason: schemeMatch[1].toLowerCase() + ' images are not fetched' };
+  } else if (src.charAt(0) === '/') {
+    path = src;
+  } else if (baseDir) {
+    path = baseDir + '/' + src;
+  } else {
+    return { kind: 'blocked', reason: 'no directory to resolve against' };
+  }
+
+  const decoded = path.split('/').map(decodePathSegment).join('/');
+  const normalized = normalizePath(decoded);
+  const encoded = normalized.split('/').map(encodeURIComponent).join('/');
+  return { kind: 'file', url: 'hrimg://local' + encoded, path: normalized };
+}
+
+function replaceImageWithNote(img, cssClass, label, detail) {
+  const note = document.createElement('span');
+  note.className = 'img-note ' + cssClass;
+  note.textContent = label + ' ';
+  const code = document.createElement('code');
+  code.textContent = detail;
+  note.appendChild(code);
+  if (img.parentNode) img.parentNode.replaceChild(note, img);
+}
+
+// Rewrite every <img> under `root`. Idempotent — already-rewritten images carry
+// data-hr-resolved and are skipped, so repeat renders don't re-resolve.
+// marked 15 does not escape the image description, so
+// `![" onerror="alert(1)](x.png)` closes the alt attribute and injects its own.
+// Every attribute an image legitimately needs is known, so drop the rest of the
+// injectable surface: event handlers, and srcset, which would reach the network
+// behind the src we control.
+function stripUnsafeImageAttributes(img) {
+  for (const attribute of Array.from(img.attributes)) {
+    const name = attribute.name.toLowerCase();
+    const isEventHandler = name.indexOf('on') === 0;
+    if (isEventHandler || name === 'srcset') img.removeAttribute(attribute.name);
+  }
+}
+
+function resolveImagesIn(root, baseDir) {
+  if (!root) return;
+  for (const img of Array.from(root.querySelectorAll('img'))) {
+    if (img.dataset.hrResolved) continue;
+    stripUnsafeImageAttributes(img);
+    const original = img.getAttribute('src') || '';
+    const resolved = resolveImageSource(original, baseDir);
+    img.dataset.hrResolved = '1';
+    if (resolved.kind === 'inline') continue;
+    if (resolved.kind === 'blocked') {
+      replaceImageWithNote(img, 'blocked', resolved.reason + ':', original);
+      continue;
+    }
+    img.addEventListener('error', function () {
+      replaceImageWithNote(img, 'missing', 'image not found:', resolved.path);
+    }, { once: true });
+    img.setAttribute('src', resolved.url);
+  }
 }
 
 function escapeHtml(s) {
@@ -1400,7 +1555,7 @@ function renderComment(c, idx) {
       <span class="check">✓</span><span class="check check-2">✓</span>
     </div>
   `;
-  const bodyHtml = (window.marked && marked.parse) ? marked.parse(c.body || '') : escapeHtml(c.body || '');
+  const bodyHtml = (window.marked && marked.parse) ? marked.parse(withLinkDefinitions(c.body || '')) : escapeHtml(c.body || '');
   return `
     <div class="comment ${isAgent ? 'is-agent' : ''}" data-id="${escapeHtml(c.id)}">
       <div class="comment-head">
@@ -1600,7 +1755,7 @@ function render() {
       if (!highlighted) highlighted = '​';
       bodyHtml = `<pre class="code-line"><code class="hljs language-${hljsLang}">${highlighted}</code></pre>`;
     } else {
-      bodyHtml = marked.parse(b.text);
+      bodyHtml = marked.parse(withLinkDefinitions(b.text));
     }
 
     // In code mode the clickable gutter (line number) IS the "new thread"
@@ -1641,6 +1796,9 @@ function render() {
   // ── Render any ```mermaid``` diagrams in content + sidebar ──────────────
   // Fire-and-forget — mermaid.render is async; the rest of the render path
   // doesn't depend on diagrams being painted.
+  // Point every <img> at the hrimg: scheme before mermaid/hljs touch the DOM.
+  resolveImagesIn(document.getElementById('content'), state.fileDir);
+  resolveImagesIn(document.getElementById('sidebar-threads'), state.fileDir);
   renderMermaidIn(document.getElementById('content'));
   renderMermaidIn(document.getElementById('sidebar-threads'));
   // Syntax-highlight ```lang fenced blocks in markdown content + comment
@@ -2058,6 +2216,10 @@ function showOverlay(payload) {
   ov.classList.add('visible');
   ov.setAttribute('aria-hidden', 'false');
   document.getElementById('overlay-body').scrollTop = 0;
+  // Images in a linked document resolve against THAT file's directory, not
+  // the one being reviewed.
+  const overlayDir = path.slice(0, path.lastIndexOf('/'));
+  resolveImagesIn(document.getElementById('overlay-body'), overlayDir);
   // Render mermaid diagrams + hljs-highlight fenced code inside the
   // linked-document overlay too.
   renderMermaidIn(document.getElementById('overlay-body'));
@@ -2411,6 +2573,8 @@ window.hr = {
   applyState(payload) {
     // fileExt must be set BEFORE splitBlocks — splitBlocks branches on isCodeMode().
     state.fileExt = (payload.fileExt || '').toLowerCase();
+    state.fileDir = payload.fileDir || '';
+    state.linkDefs = collectLinkDefinitions(payload.source || '');
     state.blocks = splitBlocks(payload.source || '');
     state.comments = payload.comments || [];
     // Update the floating zoom indicator. Swift owns the authoritative value.

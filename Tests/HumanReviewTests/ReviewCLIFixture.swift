@@ -137,6 +137,30 @@ final class ReviewCLIFixture: @unchecked Sendable {
         try? contents.write(toFile: path(name), atomically: true, encoding: .utf8)
     }
 
+    func makeDirectory(named name: String) {
+        try? FileManager.default.createDirectory(at: workingDirectory.appendingPathComponent(name),
+                                                 withIntermediateDirectories: true)
+    }
+
+    /// Writes a real 64x48 PNG, creating any intermediate directories.
+    func writePNGFile(named name: String) {
+        let url = workingDirectory.appendingPathComponent(name)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        try? Data(base64Encoded: ReviewCLIFixture.samplePNGBase64)?.write(to: url)
+    }
+
+    static let samplePNGWidth = 64
+
+    static let samplePNGBase64 = """
+    iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAYAAAChS3wfAAAAhUlEQVR4nOXOoQEAAAwCIE/f53oGYYFO\
+    cu1rPKDxgMYDGg9oPKDxgMYDGg9oPKDxgMYDGg9oPKDxgMYDGg9oPKDxgMYDGg9oPKDxgMYDGg9oPKDx\
+    gMYDGg9oPKDxgMYDGg9oPKDxgMYDGg9oPKDxgMYDGg9oPKDxgMYDGg9oPKDxgMYD2ABBvem0IOFgggAA\
+    AABJRU5ErkJggg==
+    """
+
+    static var samplePNGDataURI: String { "data:image/png;base64,\(samplePNGBase64)" }
+
     func path(_ name: String) -> String {
         workingDirectory.appendingPathComponent(name).path
     }
