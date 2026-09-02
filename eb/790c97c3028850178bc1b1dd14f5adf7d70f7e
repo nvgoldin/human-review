@@ -1,0 +1,30 @@
+Tests/HumanReviewTests/ImageRenderingTests.swift
+  s_8ab798f9609005::t_9297c123fe1a95 490-498
+  s_8ab798f9609005::t_2c0cc00fecce2e 299,305
+  s_8ab798f9609005::t_b691049bb75ffe 225-298,300-304,306-329
+  s_8ab798f9609005::t_2fdbc889be1ba0 468
+HANDOFF.md
+  s_8ab798f9609005::t_0ba33468703e1a 154-173
+README.md
+  s_8ab798f9609005::t_115787dcceae88 339-351
+Sources/human-review/main.swift
+  s_8ab798f9609005::t_917f3cfab64fb0 1002,1007-1030,1100-1102,1140-1200,1247,1254-1255,1260,1267,1275-1277,1293-1320,1335-1353,1388,1394,1400-1412,1453,1921-1925,2429-2430
+skills/human-review/SKILL.md
+  s_8ab798f9609005::t_7372ad6bdb3ecc 238-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "eb790c97c3028850178bc1b1dd14f5adf7d70f7e",
+  "prompts": {},
+  "sessions": {
+    "s_8ab798f9609005": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f96a16a4-2656-434b-b3f0-5ad897f3d39e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "ngoldin@virtual-gate.net <ngoldin@virtual-gate.net>"
+    }
+  }
+}
