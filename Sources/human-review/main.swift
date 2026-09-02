@@ -917,7 +917,8 @@ final class CommandRouter {
                                      replyTo: nil, author: author, scope: .global)
                 } else {
                     guard let line = obj["line"] as? Int else { throw CmdErr.missing("line") }
-                    let (start, text) = CLI.nearestBlock(in: store.source, around: max(0, line - 1))
+                    let (start, text) = CLI.anchor(in: store.source, forLine: line,
+                                                   lineByLine: CLI.rendersLineByLine(store.fileURL))
                     store.addComment(line: start, anchorText: text, body: body,
                                      replyTo: nil, author: author, scope: .block)
                 }
@@ -1976,7 +1977,8 @@ enum CLI {
                     FileHandle.standardError.write("--line is required (or --reply-to, or --global)\n".data(using: .utf8)!)
                     return 2
                 }
-                let (start, text) = nearestBlock(in: store.source, around: max(0, line - 1))
+                let (start, text) = anchor(in: store.source, forLine: line,
+                                           lineByLine: rendersLineByLine(url))
                 result = store.addComment(line: start, anchorText: text, body: body,
                                           replyTo: nil, author: author, scope: .block)
             }
@@ -2569,6 +2571,24 @@ enum CLI {
     static func resolveURL(_ path: String) -> URL {
         let expanded = (path as NSString).expandingTildeInPath
         return URL(fileURLWithPath: expanded).standardizedFileURL
+    }
+
+    /// True for anything the viewer renders line by line rather than as
+    /// markdown blocks. Mirrors `isCodeMode()` in viewer.html.
+    static func rendersLineByLine(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return !ext.isEmpty && ext != "md" && ext != "markdown"
+    }
+
+    /// Where a `--line N` comment anchors. A code file is one block per line,
+    /// so it anchors to that exact line; markdown anchors to the surrounding
+    /// block, which is what the viewer makes commentable.
+    static func anchor(in source: String, forLine line: Int, lineByLine: Bool) -> (start: Int, text: String) {
+        guard lineByLine else { return nearestBlock(in: source, around: max(0, line - 1)) }
+        let lines = source.components(separatedBy: "\n")
+        guard !lines.isEmpty else { return (0, "") }
+        let index = min(max(0, line - 1), lines.count - 1)
+        return (index, lines[index])
     }
 
     static func nearestBlock(in source: String, around target: Int) -> (start: Int, text: String) {

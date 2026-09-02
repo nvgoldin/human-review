@@ -48,7 +48,7 @@ The shipped .app lives outside the repo:
 ```
 ~/Applications/human-review.app/
 └── Contents/
-    ├── Info.plist                               — CFBundleIdentifier dev.nadav.human-review,
+    ├── Info.plist                               — CFBundleIdentifier io.github.nvgoldin.human-review,
     │                                              NSMicrophoneUsageDescription, NSSpeechRecognitionUsageDescription
     ├── MacOS/human-review                       — the executable
     └── Resources/
@@ -85,7 +85,7 @@ The GUI polls `comments.json` every 0.5s via SHA hash compare → auto-reloads o
   "anchorLine": 42,               // 0-indexed; meaningful only for scope=block
   "anchorText": "first 80 chars of the anchored block",
   "body":       "…",              // markdown — rendered with marked (GFM + soft breaks)
-  "author":     "agent" | "Nadav Goldin" | …,
+  "author":     "agent" | "<the human's full name>" | …,
   "createdAt":  "ISO8601",
   "resolved":   false,            // only meaningful on the root
   "orphaned":   false,            // reload couldn't relocate anchorText
@@ -105,7 +105,7 @@ The GUI polls `comments.json` every 0.5s via SHA hash compare → auto-reloads o
 | `human-review get`, `wait --reply-to`, `wait --resolve` | yes, under `--author` (default `"agent"`) |
 | `human-review watch` | yes — *the watcher = the reader* |
 | `human-review list`, `watch` with `--no-ack` | no (opt-out) |
-| GUI navigation to a file with unread `scope: "global"` | yes, under `NSFullUserName()` |
+| GUI navigation to a file with unread `scope: "global"` | yes, under the human's `NSFullUserName()` |
 | GUI rendering a regular comment | no (no implicit reads on human-side render) |
 
 UI shows ✓ (delivered) at the bottom-right of every comment, transitioning smoothly to ✓✓ when any non-self author has acked.
@@ -145,7 +145,7 @@ The sidebar scrollbar is also styled to be always-visible (`::-webkit-scrollbar`
 
   1. The app must be a real `.app` bundle with a stable `CFBundleIdentifier` — TCC (microphone, speech recognition) refuses to attribute permissions to a raw SwiftPM executable launched from the terminal. `install.sh` handles this.
   2. `Info.plist` must include `NSMicrophoneUsageDescription` and `NSSpeechRecognitionUsageDescription` — without them, macOS exits silently when dictation tries to start. They live in `bundle/Info.plist`.
-  3. The `.app` must be ad-hoc-signed with a stable identifier (`codesign --sign - --identifier dev.nadav.human-review --force`). Without `--identifier`, every rebuild changes the signature hash and TCC sometimes re-prompts; with it, the grant sticks. `--deep` is intentionally omitted — codesign tries to recursively sign the SwiftPM resource `.bundle/` (which has no Mach-O / Info.plist) and fails with "bundle format unrecognized."
+  3. The `.app` must be ad-hoc-signed with a stable identifier (`codesign --sign - --identifier io.github.nvgoldin.human-review --force`). Without `--identifier`, every rebuild changes the signature hash and TCC sometimes re-prompts; with it, the grant sticks. `--deep` is intentionally omitted — codesign tries to recursively sign the SwiftPM resource `.bundle/` (which has no Mach-O / Info.plist) and fails with "bundle format unrecognized."
 
   The JS side just calls `postSwift({type: 'startDictation'})`; the Swift handler dispatches `Selector(("startDictation:"))` to `nil` so it walks the responder chain and lands on the focused WKWebView textarea. The Edit menu item uses the same selector with an empty `keyEquivalent` — macOS auto-renders the user's configured Fn-Fn shortcut from System Settings.
 
