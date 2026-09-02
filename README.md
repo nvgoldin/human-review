@@ -5,8 +5,9 @@
 <h1 align="center">human-review</h1>
 
 <p align="center">
-  <b>Code review, but the author is your agent — and it fixes things while you read.</b><br>
-  A native macOS app. No server, no account, no network.
+  <b>Code review your agent.</b><br>
+  An application made for humans that work with agents.<br>
+  <sub>Native macOS. No server, no account, no network.</sub>
 </p>
 
 <p align="center">
@@ -50,9 +51,10 @@ human-review notes.md
 
 ## What it is
 
-Your agent writes a plan, a design note, a migration script. You need to read it
-and push back. Today that means scrolling a terminal, quoting fragments back,
-and hoping the agent understood which paragraph you meant.
+Your agent writes code. It also writes the plan, the migration script and the
+design note that go with it. You need to read all of it and push back. Today
+that means scrolling a terminal, quoting fragments back, and hoping the agent
+understood which function you meant.
 
 human-review gives that conversation the shape it already has a good answer for:
 **a code review**. You comment on the exact line or paragraph. The agent replies

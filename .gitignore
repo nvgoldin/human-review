@@ -6,3 +6,8 @@ Package.resolved
 xcuserdata/
 __pycache__/
 *.pyc
+
+# human-review sidecars, from reviewing files inside this repo
+*.comments.json
+*.events.jsonl
+*.review.md
